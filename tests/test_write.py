@@ -39,7 +39,7 @@ def test_write_escape_char_readable_by_tomllib() -> None:
 
 
 def test_parse_escape_char_shorthand() -> None:
-    doc = loads('a = "\\e"\nb = """\\e"""\n')
+    doc = loads('a = "\\e"\nb = """\\e"""\n', version="1.1")
 
     assert doc["a"] == "\x1b"
     assert doc["b"] == "\x1b"

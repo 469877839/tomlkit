@@ -8,7 +8,9 @@ from typing import Any
 from typing import Callable
 
 from tomlkit._compat import decode
+from tomlkit._utils import RFC_3339_DATETIME_V1_1
 from tomlkit._utils import RFC_3339_LOOSE
+from tomlkit._utils import RFC_3339_TIME_V1_1
 from tomlkit._utils import _escaped
 from tomlkit._utils import parse_rfc3339
 from tomlkit.container import Container
@@ -49,6 +51,9 @@ from tomlkit.items import Whitespace
 from tomlkit.source import Source
 from tomlkit.source import _StateHandler
 from tomlkit.toml_document import TOMLDocument
+from tomlkit.toml_version import InputVersionError
+from tomlkit.toml_version import TOMLVersion
+from tomlkit.toml_version import normalize_version
 
 
 CTRL_I = 0x09  # Tab
@@ -100,12 +105,22 @@ class Parser:
     # adds a level of nested containers. Refuse documents beyond this depth.
     MAX_NESTING_DEPTH = 100
 
-    def __init__(self, string: str | bytes) -> None:
+    def __init__(
+        self,
+        string: str | bytes,
+        version: TOMLVersion | str = TOMLVersion.V1_0,
+    ) -> None:
         # Input to parse
         self._src = Source(decode(string))
+        self._version = normalize_version(version)
 
         self._aot_stack: list[Key] = []
         self._nesting_depth = 0
+
+    @property
+    def version(self) -> TOMLVersion:
+        """The TOML spec version this parser enforces on its input."""
+        return self._version
 
     @property
     def _state(self) -> _StateHandler:
@@ -172,8 +187,42 @@ class Parser:
         """
         return self._src.parse_error(exception, *args, **kwargs)
 
+    def _version_error(self, idx: int, feature: str) -> InputVersionError:
+        """A TOML 1.1-only construct encountered while parsing as 1.0."""
+        return self._src.parse_error_at(idx, InputVersionError, feature)
+
+    def _reject_v11_time_feature(self, idx: int, raw: str) -> None:
+        """Diagnose TOML 1.1-only time grammar found while parsing as 1.0.
+
+        The relaxed grammar permits omitting the seconds and, for a
+        date-less (local) time, carrying an offset (offset-time). Both are
+        rejected explicitly here instead of surfacing as generic number/
+        time errors, so the message names the actual 1.1 feature.
+        """
+        if self._version is not TOMLVersion.V1_0:
+            return
+
+        m = RFC_3339_LOOSE.match(raw)
+        if m is None or not m.group("time"):
+            return
+
+        # Only name the 1.1 grammar when the token is otherwise valid under
+        # it; an out-of-range field (e.g. ``99:99``) stays a plain time error
+        # in both versions rather than a misleading version diagnostic.
+        v11_re = (
+            RFC_3339_DATETIME_V1_1 if m.group("date") else RFC_3339_TIME_V1_1
+        )
+        if v11_re.match(raw) is None:
+            return
+
+        if m.group("second") is None:
+            raise self._version_error(idx, "a time value without seconds")
+
+        if m.group("tz") and not m.group("date"):
+            raise self._version_error(idx, "an offset on a local time")
+
     def parse(self) -> TOMLDocument:
-        body = TOMLDocument(True)
+        body = TOMLDocument(True, version=self._version)
 
         # Take all keyvals outside of tables/AoT's.
         while not self.end():
@@ -520,13 +569,15 @@ class Parser:
             self._src.advance_until(_NUM_STOP)
 
             raw = self.extract()
+            value_start = self._marker
 
             m = RFC_3339_LOOSE.match(raw)
             if m:
                 if m.group("date") and m.group("time"):
                     # datetime
+                    self._reject_v11_time_feature(value_start, raw)
                     try:
-                        dt = parse_rfc3339(raw)
+                        dt = parse_rfc3339(raw, version=self._version)
                         assert isinstance(dt, datetime.datetime)
                         return DateTime(
                             dt.year,
@@ -540,6 +591,8 @@ class Parser:
                             trivia,
                             raw,
                         )
+                    except InputVersionError:
+                        raise
                     except ValueError:
                         raise self.parse_error(InvalidDateTimeError) from None
 
@@ -557,7 +610,8 @@ class Parser:
                         if not time_part:
                             return date
 
-                        dt = parse_rfc3339(raw + time_part)
+                        self._reject_v11_time_feature(value_start, raw + time_part)
+                        dt = parse_rfc3339(raw + time_part, version=self._version)
                         assert isinstance(dt, datetime.datetime)
                         return DateTime(
                             dt.year,
@@ -571,12 +625,15 @@ class Parser:
                             trivia,
                             raw + time_part,
                         )
+                    except InputVersionError:
+                        raise
                     except ValueError:
                         raise self.parse_error(InvalidDateError) from None
 
                 if m.group("time"):
+                    self._reject_v11_time_feature(value_start, raw)
                     try:
-                        t = parse_rfc3339(raw)
+                        t = parse_rfc3339(raw, version=self._version)
                         assert isinstance(t, datetime.time)
                         return Time(
                             t.hour,
@@ -587,6 +644,8 @@ class Parser:
                             trivia,
                             raw,
                         )
+                    except InputVersionError:
+                        raise
                     except ValueError:
                         raise self.parse_error(InvalidTimeError) from None
 
@@ -703,6 +762,7 @@ class Parser:
 
         elems = Container(True)
         expect_key = True
+        comma_idx: int | None = None
         while True:
             while True:
                 # consume whitespace and newlines
@@ -710,15 +770,38 @@ class Parser:
                 self.consume(" \t\n\r")
                 raw = self._src[mark : self._idx]
                 if raw:
+                    if self._version is TOMLVersion.V1_0:
+                        # TOML 1.0 inline tables must stay on one logical line;
+                        # a line break inside ``{ ... }`` is a 1.1 feature.
+                        nl_index = next(
+                            (i for i, ch in enumerate(raw) if ch in "\n\r"), None
+                        )
+                        if nl_index is not None:
+                            raise self._version_error(
+                                mark + nl_index,
+                                "a line break inside an inline table",
+                            )
                     elems.add(Whitespace(raw))
 
                 if self._current != "#":
                     break
 
+                if self._version is TOMLVersion.V1_0:
+                    # Comments inside inline tables are part of the same 1.1
+                    # relaxation; they only appear where a line break is legal.
+                    raise self._version_error(
+                        self._idx, "a comment inside an inline table"
+                    )
                 cws, comment, trail = self._parse_comment_trail(parse_trail=False)
                 elems.add(Comment(Trivia("", cws, comment, trail)))
 
             if self._current == "}":
+                if self._version is TOMLVersion.V1_0 and comma_idx is not None:
+                    # TOML 1.0 forbids a trailing comma in an inline table;
+                    # it is one of the 1.1 relaxations.
+                    raise self._version_error(
+                        comma_idx, "a trailing comma in an inline table"
+                    )
                 # consume closing bracket, EOF here doesn't matter
                 self.inc()
                 break
@@ -729,12 +812,14 @@ class Parser:
                 key, val = self._parse_key_value(False)
                 elems.add(key, val)
                 expect_key = False
+                comma_idx = None
                 continue
 
             if self._current != ",":
                 raise self.parse_error(UnexpectedCharError, self._current)
 
             elems.add(Whitespace(","))
+            comma_idx = self._idx
             # consume comma, EOF here is an issue (middle of inline table)
             self.inc(exception=UnexpectedEofError)
             expect_key = True
@@ -837,6 +922,9 @@ class Parser:
             return ""
 
         if self._current in _escaped:
+            if self._version is TOMLVersion.V1_0 and self._current == "e":
+                # self._idx points at the ``e``; report the preceding backslash
+                raise self._version_error(self._idx - 1, "the '\\e' escape sequence")
             c = _escaped[self._current]
 
             # consume this char, EOF here is an issue (middle of string)
@@ -857,6 +945,11 @@ class Parser:
             raise self.parse_error(InvalidUnicodeValueError)
 
         if self._current == "x":
+            if self._version is TOMLVersion.V1_0:
+                # self._idx points at the ``x``; report the preceding backslash
+                raise self._version_error(
+                    self._idx - 1, "the '\\xXX' hex escape sequence"
+                )
             h, he = self._peek_hex()
             if h is not None:
                 assert he is not None

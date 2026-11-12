@@ -41,6 +41,7 @@ from tomlkit.items import Time
 from tomlkit.items import Trivia
 from tomlkit.items import item
 from tomlkit.parser import Parser
+from tomlkit.toml_version import OutputVersionError
 
 
 @pytest.fixture()
@@ -1078,21 +1079,25 @@ def test_datetimes_behave_like_datetimes_fold() -> None:
     assert k.fold == 1
 
 
-def test_time_with_tzinfo_renders_as_local_time() -> None:
-    # TOML local times have no offset/timezone; a tz-aware time must
-    # render without its offset, otherwise the output is not valid TOML
-    # and this library's own parser cannot read it back. The offset is
-    # not representable in the format, so a round-trip yields the local
-    # (naive) time.
+def test_time_with_tzinfo_is_offset_time() -> None:
+    # A tz-aware time is a TOML 1.1 offset-time: the offset is rendered in
+    # 1.1 output and read back. TOML 1.0 has no spelling for it, so 1.0
+    # output raises instead of silently dropping the offset.
     tz = timezone(timedelta(hours=2))
     i = item(time(7, 32, tzinfo=tz))
-    assert i.as_string() == "07:32:00"
-    assert parse(f"t = {i.as_string()}")["t"] == time(7, 32)
+    assert i.as_string(version="1.1") == "07:32:00+02:00"
+    assert parse(f"t = {i.as_string(version='1.1')}", version="1.1")["t"] == time(
+        7, 32, tzinfo=tz
+    )
 
-    # replace() keeps the same rendering rule.
+    with pytest.raises(OutputVersionError):
+        i.as_string(version="1.0")
+
+    # replace() keeps the offset and the same rendering rule.
     j = i.replace(hour=13)
-    assert j.as_string() == "13:32:00"
-    assert parse(f"t = {j.as_string()}")["t"] == time(13, 32)
+    assert j.as_string(version="1.1") == "13:32:00+02:00"
+    with pytest.raises(OutputVersionError):
+        j.as_string(version="1.0")
 
 
 @pytest.mark.parametrize(
@@ -1380,7 +1385,10 @@ def test_appending_to_compact_inline_table_uses_spaced_separator() -> None:
 
 
 def test_append_key_after_inline_table_trailing_comment() -> None:
-    doc = parse("tbl = {\n    p = { k = 1 },\n    q = { k = 2 }  # comment\n}\n")
+    doc = parse(
+        "tbl = {\n    p = { k = 1 },\n    q = { k = 2 }  # comment\n}\n",
+        version="1.1",
+    )
     doc["tbl"]["added"] = 3
 
     # The separator for the new key must be placed after the previous value,
@@ -1388,8 +1396,10 @@ def test_append_key_after_inline_table_trailing_comment() -> None:
     # comment and the result no longer round-trips. See #512.
     rendered = doc.as_string()
     assert "# comment," not in rendered
-    assert parse(rendered) == {"tbl": {"p": {"k": 1}, "q": {"k": 2}, "added": 3}}
-    assert parse(rendered).as_string() == rendered
+    assert parse(rendered, version="1.1") == {
+        "tbl": {"p": {"k": 1}, "q": {"k": 2}, "added": 3}
+    }
+    assert parse(rendered, version="1.1").as_string() == rendered
 
 
 def test_deleting_inline_table_middle_element_does_not_leave_double_separator() -> None:

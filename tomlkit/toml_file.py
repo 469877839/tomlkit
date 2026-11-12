@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from tomlkit.api import loads
 from tomlkit.toml_document import TOMLDocument
+from tomlkit.toml_version import TOMLVersion
 
 
 if TYPE_CHECKING:
@@ -26,8 +27,14 @@ class TOMLFile:
         self._path = path
         self._linesep: str = os.linesep
 
-    def read(self) -> TOMLDocument:
-        """Read the file content as a :class:`tomlkit.toml_document.TOMLDocument`."""
+    def read(
+        self, *, version: TOMLVersion | str = TOMLVersion.V1_0
+    ) -> TOMLDocument:
+        """Read the file content as a :class:`tomlkit.toml_document.TOMLDocument`.
+
+        ``version`` selects the TOML spec version the content is validated
+        against; see :func:`tomlkit.parse`.
+        """
         with open(self._path, encoding="utf-8", newline="") as f:
             content = f.read()
 
@@ -43,7 +50,7 @@ class TOMLFile:
                 else:
                     self._linesep = "mixed"
 
-            return loads(content)
+            return loads(content, version=version)
 
     def write(self, data: TOMLDocument) -> None:
         """Write the TOMLDocument to the file."""

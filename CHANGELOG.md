@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Explicit TOML spec version selection. `parse()`, `loads()`, `load()`, `TOMLFile.read()`, `value()`, `key_value()` and the `date()`/`time()`/`datetime()` constructors take a `version` argument (`"1.0"` or `"1.1"`, default `"1.0"`), and `dumps()`/`dump()` take an output `version` (defaulting to the document's own version). The default still accepts and emits TOML 1.0; in 1.0 mode the TOML 1.1 extensions (`\e`/`\xXX` escapes, seconds-less and offset local times, and newlines, comments and trailing commas in inline tables) raise a positioned `tomlkit.toml_version.InputVersionError` instead of being accepted silently.
+- Lossless 1.1-to-1.0 output conversion: `\e`/`\xXX` are rewritten to `\u001b`/`\u00HH`, a missing seconds field is restored and multiline inline tables are flattened onto one line. Values with no TOML 1.0 spelling, such as an offset-time, raise `tomlkit.toml_version.OutputVersionError` naming the output location rather than producing an invalid document or merely swapping a version label.
+- Add the `tomlkit.toml_version` module with the `TOMLVersion` enum, version normalization and the version-specific exceptions; all three are re-exported from `tomlkit`.
+
 ### Changed
 
 - Speed up repeated array appends by keeping existing indexes instead of rebuilding them.

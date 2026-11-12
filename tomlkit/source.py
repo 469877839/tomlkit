@@ -225,20 +225,37 @@ class Source(str):
         """
         Creates a generic "parse error" at the current position.
         """
-        line, col = self._to_linecol()
+        return self.parse_error_at(self.idx, exception, *args, **kwargs)
+
+    def parse_error_at(
+        self,
+        idx: int,
+        exception: type[ParseError] = ParseError,
+        *args: Any,
+        **kwargs: Any,
+    ) -> ParseError:
+        """Create a parse error located at the given absolute ``idx``.
+
+        Used by diagnostics that must point at the construct that triggered
+        them rather than at the parser's current position, which may have
+        advanced past it already.
+        """
+        line, col = self._to_linecol(idx)
 
         return exception(line, col, *args, **kwargs)
 
-    def _to_linecol(self) -> tuple[int, int]:
+    def _to_linecol(self, idx: int | None = None) -> tuple[int, int]:
         # `keepends` keeps each line's own terminator inside its length: a "\r\n"
         # break occupies two characters, and assuming a single one made the
         # running offset fall one behind per CRLF line, so an error later in the
         # document was reported on the wrong line and column.
+        if idx is None:
+            idx = self.idx
         lines = self.splitlines(keepends=True)
         cur = 0
         for i, line in enumerate(lines):
-            if cur + len(line) > self.idx:
-                return (i + 1, self.idx - cur)
+            if cur + len(line) > idx:
+                return (i + 1, idx - cur)
 
             cur += len(line)
 

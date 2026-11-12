@@ -25,11 +25,17 @@ from tomlkit.api import time
 from tomlkit.api import unregister_encoder
 from tomlkit.api import value
 from tomlkit.api import ws
+from tomlkit.toml_version import InputVersionError
+from tomlkit.toml_version import OutputVersionError
+from tomlkit.toml_version import TOMLVersion
 
 
 __version__ = "0.15.2"
 __all__ = [
     "TOMLDocument",
+    "TOMLVersion",
+    "InputVersionError",
+    "OutputVersionError",
     "aot",
     "array",
     "boolean",

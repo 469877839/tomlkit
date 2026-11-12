@@ -33,6 +33,7 @@ Modifying
 TOML Kit provides an intuitive API to modify TOML documents::
 
     >>> from tomlkit import dumps
+    >>> from tomlkit import dumps
     >>> from tomlkit import parse
     >>> from tomlkit import table
 
@@ -146,3 +147,37 @@ It can be created with the following code::
     >>> database["enabled"] = True
 
     >>> doc["database"] = database
+
+
+TOML 1.0 vs TOML 1.1
+--------------------
+
+By default TOML Kit parses and writes TOML 1.0 documents. Pass ``version="1.1"``
+to accept the TOML 1.1 extensions: the ``\e`` and ``\xHH`` escapes, times with
+an optional seconds field or an offset, and inline tables that span several
+lines, contain comments or carry a trailing comma::
+
+    >>> from tomlkit import dumps
+    >>> from tomlkit import parse
+
+    # 1.1-only syntax is rejected with a positioned error in 1.0 mode
+    >>> parse('t = 07:32\n')
+    Traceback (most recent call last):
+    ...
+    tomlkit.toml_version.InputVersionError: a time value without seconds is ... at line 1 col 4
+
+    >>> doc = parse(
+    ...     'esc = "a\\eb"\ntime = 07:32\ntable = {\n a = 1,\n}\n',
+    ...     version="1.1",
+    ... )
+
+A document remembers the version it was parsed with, so re-serializing it
+without arguments preserves its original text. Writing 1.1 content explicitly
+as 1.0 rewrites the representable constructs losslessly and raises
+``tomlkit.toml_version.OutputVersionError`` for values with no 1.0 spelling,
+such as an offset-time::
+
+    >>> print(dumps(doc, version="1.0"))
+    esc = "a\u001bb"
+    time = 07:32:00
+    table = {a = 1}

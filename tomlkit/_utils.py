@@ -9,11 +9,19 @@ from datetime import datetime
 from datetime import time
 from datetime import timedelta
 from datetime import timezone
+from datetime import tzinfo
 from typing import Any
 
 from tomlkit._compat import decode
+from tomlkit.toml_version import TOMLVersion
 
 
+# The optional seconds group is the TOML 1.1 relaxation of the time grammar
+# (``partial-time = time-hour ":" time-minute [ time-second [ time-secfrac ] ]``)
+# and the trailing ``tz`` group is the 1.1 offset-time production. A fraction
+# stays attached to the seconds, matching both versions' ABNF. Parsing in
+# TOML 1.0 mode validates against the stricter 1.0 regexes first, so these
+# groups never accept 1.1-only tokens there; see ``Parser._parse_value``.
 RFC_3339_LOOSE = re.compile(
     "^"
     r"(?P<date>(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2}))?"  # Date
@@ -37,16 +45,69 @@ RFC_3339_DATETIME = re.compile(
 
 RFC_3339_DATE = re.compile("^([0-9]+)-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])$")
 
+# Strict TOML 1.0 local time used by the value constructors: full
+# ``HH:MM:SS``, fraction only after the seconds, no offset. The parser's
+# relaxed regex below still accepts a seconds-less token, but the 1.0 parse
+# path rejects it explicitly with a version diagnostic.
+RFC_3339_TIME_V1_0 = re.compile(
+    r"^(?P<hour>[01][0-9]|2[0-3]):(?P<minute>[0-5][0-9])"
+    r":(?P<second>[0-5][0-9]|60)(\.(?P<fraction>[0-9]+))?$"
+)
+
+# Looser variant (seconds optional) matching the parser's LOOSE tokenisation;
+# parse-time gating decides whether the relaxed form is allowed.
 RFC_3339_TIME = re.compile(
     r"^(?P<hour>[01][0-9]|2[0-3]):(?P<minute>[0-5][0-9])"
     r"(:(?P<second>[0-5][0-9]|60)(\.(?P<fraction>[0-9]+))?)?$"
 )
 
+# TOML 1.1 time/offset-time: seconds may be omitted and an offset may follow
+# the partial time. The fraction still only attaches to the seconds.
+# https://toml.io/en/v1.1.0#offset-date-time
+RFC_3339_TIME_V1_1 = re.compile(
+    r"^(?P<hour>[01][0-9]|2[0-3]):(?P<minute>[0-5][0-9])"
+    r"(:(?P<second>[0-5][0-9]|60)(\.(?P<fraction>[0-9]+))?)?"
+    r"(?P<tz>[Zz]|[\+\-]([01][0-9]|2[0-3]):([0-5][0-9]))?$"
+)
+
+# TOML 1.1 local/offset date-time: same relaxations as the time production.
+RFC_3339_DATETIME_V1_1 = re.compile(
+    "^"
+    r"(?P<year>\d{4})-(?P<month>0[1-9]|1[012])-(?P<day>0[1-9]|[12][0-9]|3[01])"  # Date
+    "[Tt ]"  # Separator
+    r"(?P<hour>[01][0-9]|2[0-3]):(?P<minute>[0-5][0-9])"
+    r"(:(?P<second>[0-5][0-9]|60)(\.(?P<fraction>[0-9]+))?)?"
+    r"(?P<tz>([Zz])|([\+\-]([01][0-9]|2[0-3]):([0-5][0-9])))?"  # Timezone
+    "$"
+)
+
 _utc = timezone(timedelta(), "UTC")
 
 
-def parse_rfc3339(string: str) -> datetime | date | time:
-    m = RFC_3339_DATETIME.match(string)
+def _parse_tzinfo(m: re.Match[str]) -> tzinfo | None:
+    tz = m.group("tz")
+    if not tz:
+        return None
+    if tz.upper() == "Z":
+        return _utc
+
+    sign = tz[0]
+    hour_offset, minute_offset = map(int, tz[1:].split(":"))
+    offset = timedelta(seconds=hour_offset * 3600 + minute_offset * 60)
+    if sign == "-":
+        offset = -offset
+
+    return timezone(offset, tz)
+
+
+def parse_rfc3339(
+    string: str, *, version: TOMLVersion = TOMLVersion.V1_0
+) -> datetime | date | time:
+    datetime_re = (
+        RFC_3339_DATETIME_V1_1 if version is TOMLVersion.V1_1 else RFC_3339_DATETIME
+    )
+    time_re = RFC_3339_TIME_V1_1 if version is TOMLVersion.V1_1 else RFC_3339_TIME
+    m = datetime_re.match(string)
     if m:
         year = int(m.group("year"))
         month = int(m.group("month"))
@@ -59,25 +120,16 @@ def parse_rfc3339(string: str) -> datetime | date | time:
         if m.group("fraction"):
             microsecond = int((f"{m.group('fraction'):<06s}")[:6])
 
-        if m.group("tz"):
-            # Timezone
-            tz = m.group("tz")
-            if tz.upper() == "Z":
-                tzinfo = _utc
-            else:
-                sign = tz[0]
-                hour_offset, minute_offset = map(int, tz[1:].split(":"))
-                offset = timedelta(seconds=hour_offset * 3600 + minute_offset * 60)
-                if sign == "-":
-                    offset = -offset
-
-                tzinfo = timezone(offset, tz)
-
-            return datetime(
-                year, month, day, hour, minute, second, microsecond, tzinfo=tzinfo
-            )
-        else:
-            return datetime(year, month, day, hour, minute, second, microsecond)
+        return datetime(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            microsecond,
+            tzinfo=_parse_tzinfo(m),
+        )
 
     m = RFC_3339_DATE.match(string)
     if m:
@@ -87,7 +139,7 @@ def parse_rfc3339(string: str) -> datetime | date | time:
 
         return date(year, month, day)
 
-    m = RFC_3339_TIME.match(string)
+    m = time_re.match(string)
     if m:
         hour = int(m.group("hour"))
         minute = int(m.group("minute"))
@@ -97,7 +149,11 @@ def parse_rfc3339(string: str) -> datetime | date | time:
         if m.group("fraction"):
             microsecond = int((f"{m.group('fraction'):<06s}")[:6])
 
-        return time(hour, minute, second, microsecond)
+        # A TOML 1.1 offset-time is the only time value allowed to carry an
+        # offset; the TOML 1.0 regex has no ``tz`` group so this stays None.
+        tzinfo = _parse_tzinfo(m) if version is TOMLVersion.V1_1 else None
+
+        return time(hour, minute, second, microsecond, tzinfo)
 
     raise ValueError("Invalid RFC 3339 string")
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _datetime
+import inspect
 import re
 
 from collections.abc import Iterable
@@ -11,6 +12,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import TypeVar
 
+from tomlkit._utils import RFC_3339_TIME_V1_0
 from tomlkit._utils import parse_rfc3339
 from tomlkit._utils import validate_comment
 from tomlkit.container import Container
@@ -38,6 +40,8 @@ from tomlkit.items import Whitespace
 from tomlkit.items import item as item
 from tomlkit.parser import Parser
 from tomlkit.toml_document import TOMLDocument as TOMLDocument
+from tomlkit.toml_version import TOMLVersion
+from tomlkit.toml_version import normalize_version
 
 
 if TYPE_CHECKING:
@@ -46,73 +50,140 @@ if TYPE_CHECKING:
     E = TypeVar("E", bound=Encoder)
 
 
-def loads(string: str | bytes) -> TOMLDocument:
+def loads(
+    string: str | bytes, *, version: TOMLVersion | str = TOMLVersion.V1_0
+) -> TOMLDocument:
     """
     Parses a string into a TOMLDocument.
 
     Alias for parse().
     """
-    return parse(string)
+    return parse(string, version=version)
 
 
-def dumps(data: Mapping[str, Any], sort_keys: bool = False) -> str:
+def dumps(
+    data: Mapping[str, Any],
+    sort_keys: bool = False,
+    *,
+    version: TOMLVersion | str | None = None,
+) -> str:
     """
     Dumps a TOMLDocument into a string.
+
+    :param data: a dict-like object to dump
+    :param sort_keys: if true, sort the keys in alphabetic order
+    :param version: output spec version. When ``data`` is a
+        :class:`TOMLDocument` the default is the version it was parsed or
+        created with; otherwise it defaults to TOML 1.0. Writing 1.1 content
+        as 1.0 rewrites the representable constructs losslessly
+        (``\\e``/``\\xXX`` -> ``\\u`` escapes, seconds-less times, multiline
+        inline tables -> single-line) and raises
+        :class:`tomlkit.toml_version.OutputVersionError` for values with no
+        1.0 spelling, naming their location.
     """
+    target = _resolve_output_version(data, version)
+
     if isinstance(data, (Table, InlineTable, Container)):
         if not sort_keys:
-            return data.as_string()
+            return data.as_string(version=target)
 
-        return item(data, _sort_keys=True).as_string()
+        return item(data, _sort_keys=True).as_string(version=target)
 
     if isinstance(data, Mapping):
-        return item(dict(data), _sort_keys=sort_keys).as_string()
+        return item(dict(data), _sort_keys=sort_keys).as_string(version=target)
 
     try:
         # mapping-like wrappers (e.g. dotty_dict's Dotty) delegate
         # ``as_string`` to the document they wrap; rendering it directly
         # preserves the original layout, which re-encoding through a plain
-        # dict would lose
+        # dict would lose. Only pass the version along when the delegate
+        # accepts it, so wrappers with a plain ``as_string()`` keep working.
+        if _accepts_version_kwarg(data.as_string):  # type: ignore[attr-defined]
+            return data.as_string(version=target)  # type: ignore[attr-defined]
         return data.as_string()  # type: ignore[attr-defined]
     except AttributeError as ex:
         msg = f"Expecting Mapping or TOML Table or Container, {type(data)} given"
         raise TypeError(msg) from ex
 
 
-def load(fp: IO[str] | IO[bytes]) -> TOMLDocument:
+def _accepts_version_kwarg(as_string: Any) -> bool:
+    try:
+        parameters = inspect.signature(as_string).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.name == "version" or p.kind is inspect.Parameter.VAR_KEYWORD
+        for p in parameters
+    )
+
+
+def _resolve_output_version(
+    data: Any, version: TOMLVersion | str | None
+) -> TOMLVersion:
+    if version is not None:
+        return normalize_version(version)
+    doc_version = getattr(data, "version", None)
+    if isinstance(doc_version, TOMLVersion):
+        return doc_version
+    return TOMLVersion.V1_0
+
+
+def load(
+    fp: IO[str] | IO[bytes], *, version: TOMLVersion | str = TOMLVersion.V1_0
+) -> TOMLDocument:
     """
     Load toml document from a file-like object.
     """
-    return parse(fp.read())
+    return parse(fp.read(), version=version)
 
 
-def dump(data: Mapping[str, Any], fp: IO[str], *, sort_keys: bool = False) -> None:
+def dump(
+    data: Mapping[str, Any],
+    fp: IO[str],
+    *,
+    sort_keys: bool = False,
+    version: TOMLVersion | str | None = None,
+) -> None:
     """
     Dump a TOMLDocument into a writable file stream.
 
     :param data: a dict-like object to dump
     :param sort_keys: if true, sort the keys in alphabetic order
+    :param version: output spec version; see :func:`dumps` for the rules
 
     :Example:
 
     >>> with open("output.toml", "w") as fp:
     ...     tomlkit.dump(data, fp)
     """
-    fp.write(dumps(data, sort_keys=sort_keys))
+    fp.write(dumps(data, sort_keys=sort_keys, version=version))
 
 
-def parse(string: str | bytes) -> TOMLDocument:
+def parse(
+    string: str | bytes, *, version: TOMLVersion | str = TOMLVersion.V1_0
+) -> TOMLDocument:
     """
     Parses a string or bytes into a TOMLDocument.
+
+    ``version`` selects the TOML spec version the input is validated
+    against. The default, ``"1.0"``, accepts only TOML 1.0 documents;
+    ``"1.1"`` additionally accepts the TOML 1.1 extensions (``\\e`` and
+    ``\\xXX`` escapes, seconds-less and offset local times, and newlines,
+    comments and trailing commas in inline tables). A document that uses
+    TOML 1.1-only syntax while parsed as 1.0 raises
+    :class:`tomlkit.toml_version.InputVersionError` naming the construct.
     """
-    return Parser(string).parse()
+    return Parser(string, version=version).parse()
 
 
-def document() -> TOMLDocument:
+def document(*, version: TOMLVersion | str = TOMLVersion.V1_0) -> TOMLDocument:
     """
     Returns a new TOMLDocument instance.
+
+    ``version`` records the spec version the document is written for; it is
+    used as the default output version by :func:`dumps`.
     """
-    return TOMLDocument()
+    return TOMLDocument(version=normalize_version(version))
 
 
 # Items
@@ -182,30 +253,82 @@ def string(
     return String.from_raw(raw, type_, escape)
 
 
-def date(raw: str) -> Date:
-    """Create a TOML date."""
-    value = parse_rfc3339(raw)
+def date(
+    raw: str, *, version: TOMLVersion | str = TOMLVersion.V1_0
+) -> Date:
+    """Create a TOML date.
+
+    ``version`` selects which spec grammar the literal is validated against.
+    """
+    value = parse_rfc3339(raw, version=normalize_version(version))
     if isinstance(value, _datetime.datetime) or not isinstance(value, _datetime.date):
         raise ValueError("date() only accepts date strings.")
 
     return item(value)
 
 
-def time(raw: str) -> Time:
-    """Create a TOML time."""
-    value = parse_rfc3339(raw)
+def time(
+    raw: str, *, version: TOMLVersion | str = TOMLVersion.V1_0
+) -> Time:
+    """Create a TOML time.
+
+    TOML 1.0 requires the seconds field and forbids an offset; ``version="1.1"``
+    additionally accepts a seconds-less (``07:32``) and an offset-time
+    (``07:32:00Z``) literal and keeps its original spelling.
+    """
+    target = normalize_version(version)
+    if target is TOMLVersion.V1_0 and RFC_3339_TIME_V1_0.match(raw) is None:
+        raise ValueError(
+            f"time() only accepts TOML 1.0 time strings (HH:MM:SS), got {raw!r}"
+        )
+    value = parse_rfc3339(raw, version=target)
     if not isinstance(value, _datetime.time):
         raise ValueError("time() only accepts time strings.")
 
-    return item(value)
+    result = item(value)
+    if target is TOMLVersion.V1_1:
+        # Keep the original 1.1 spelling (e.g. seconds-less ``07:32``).
+        result = Time(
+            value.hour,
+            value.minute,
+            value.second,
+            value.microsecond,
+            value.tzinfo,
+            result.trivia,
+            raw,
+            fold=value.fold,
+        )
+    return result
 
 
-def datetime(raw: str) -> DateTime:
-    """Create a TOML datetime."""
-    value = parse_rfc3339(raw)
+def datetime(
+    raw: str, *, version: TOMLVersion | str = TOMLVersion.V1_0
+) -> DateTime:
+    """Create a TOML datetime.
+
+    ``version="1.1"`` also accepts a seconds-less literal and keeps its
+    original spelling.
+    """
+    target = normalize_version(version)
+    value = parse_rfc3339(raw, version=target)
     if not isinstance(value, _datetime.datetime):
         raise ValueError("datetime() only accepts datetime strings.")
 
+    if target is TOMLVersion.V1_1:
+        # Keep the original 1.1 spelling (e.g. seconds-less or space-separated).
+        return DateTime(
+            value.year,
+            value.month,
+            value.day,
+            value.hour,
+            value.minute,
+            value.second,
+            value.microsecond,
+            value.tzinfo,
+            Trivia(),
+            raw,
+            fold=value.fold,
+        )
     return item(value)
 
 
@@ -297,7 +420,9 @@ def key(k: str | Iterable[str]) -> Key:
     return DottedKey(keys)
 
 
-def value(raw: str) -> _Item:
+def value(
+    raw: str, *, version: TOMLVersion | str = TOMLVersion.V1_0
+) -> _Item:
     """Parse a simple value from a string.
 
     :Example:
@@ -309,14 +434,16 @@ def value(raw: str) -> _Item:
     >>> value("[1, 2, 3]")
     [1, 2, 3]
     """
-    parser = Parser(raw)
+    parser = Parser(raw, version=version)
     v = parser._parse_value()
     if not parser.end():
         raise parser.parse_error(UnexpectedCharError, char=parser._current)
     return v
 
 
-def key_value(src: str) -> tuple[Key, _Item]:
+def key_value(
+    src: str, *, version: TOMLVersion | str = TOMLVersion.V1_0
+) -> tuple[Key, _Item]:
     """Parse a key-value pair from a string.
 
     Anything other than whitespace or a comment after the pair is an error,
@@ -327,7 +454,7 @@ def key_value(src: str) -> tuple[Key, _Item]:
     >>> key_value("foo = 1")
     (Key('foo'), 1)
     """
-    parser = Parser(src)
+    parser = Parser(src, version=version)
     k, v = parser._parse_key_value(parse_comment=True)
     if not parser.end():
         raise parser.parse_error(UnexpectedCharError, char=parser._current)

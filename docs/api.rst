@@ -47,6 +47,21 @@ TOML Items
    :members:
    :exclude-members: item, AbstractTable
 
+TOML Versions
+-------------
+
+.. module:: tomlkit.toml_version
+
+.. autoclass:: TOMLVersion
+   :show-inheritance:
+   :members:
+
+.. autoexception:: InputVersionError
+   :show-inheritance:
+
+.. autoexception:: OutputVersionError
+   :show-inheritance:
+
 TOML Exceptions
 ---------------
 

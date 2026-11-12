@@ -34,6 +34,10 @@ from tomlkit._utils import escape_string
 from tomlkit._utils import validate_comment
 from tomlkit.exceptions import ConvertError
 from tomlkit.exceptions import InvalidStringError
+from tomlkit.toml_version import OutputVersionError
+from tomlkit.toml_version import TOMLVersion
+from tomlkit.toml_version import downgrade_v11_escapes
+from tomlkit.toml_version import downgrade_v11_key_path
 
 
 if TYPE_CHECKING:
@@ -266,15 +270,50 @@ def item(value: Any, _parent: Item | None = None, _sort_keys: bool = False) -> I
 
 
 def _format_time(value: time) -> str:
-    # TOML local times carry no offset or timezone (the spec's examples
-    # are plain ``07:32:00``); keeping the offset in the rendered raw
-    # value would produce a literal this library's own parser rejects.
     # Built from the fields (not ``isoformat``/``replace``) so it stays
-    # correct even when called on a ``Time`` from ``Time._new``.
+    # correct even when called on a ``Time`` from ``Time._new``. A TOML 1.1
+    # offset-time is the only time value allowed to carry an offset; the
+    # caller decides whether that spelling is valid for the output version.
     s = f"{value.hour:02d}:{value.minute:02d}:{value.second:02d}"
     if value.microsecond:
         s += f".{value.microsecond:06d}".rstrip("0")
+    offset = value.utcoffset()
+    if value.tzinfo is not None and offset is not None:
+        total_seconds = int(offset.total_seconds())
+        sign = "+" if total_seconds >= 0 else "-"
+        total_seconds = abs(total_seconds)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes = remainder // 60
+        s += f"{sign}{hours:02d}:{minutes:02d}"
     return s
+
+
+def _position_in_text(prefix: str) -> tuple[int, int]:
+    """1-based (line, column) of the position immediately after ``prefix``."""
+    line = prefix.count("\n") + 1
+    col = len(prefix.rsplit("\n", 1)[-1]) + 1
+    return line, col
+
+
+def _render_single_line(item: Item, version: TOMLVersion) -> str:
+    """Render ``item`` without line breaks for TOML 1.0 inline output.
+
+    A multiline array is collapsed onto one line (comments it carried are
+    dropped) and a multiline inline table is flattened; other items render
+    normally. Nested values keep their own 1.0 rewrite rules.
+    """
+    if isinstance(item, Array):
+        return item._as_single_line_string(version)
+    if isinstance(item, InlineTable) and item._needs_v10_rewrite():
+        return item._as_single_line_string(version)
+    return item.as_string(version=version)
+
+
+def _render_inline_value(item: Item, version: TOMLVersion | None) -> str:
+    """Render a value inside an inline table for the requested version."""
+    if version == TOMLVersion.V1_0:
+        return _render_single_line(item, TOMLVersion.V1_0)
+    return item.as_string(version=version)
 
 
 def _format_datetime(value: datetime) -> str:
@@ -299,6 +338,58 @@ def _format_datetime(value: datetime) -> str:
         - offset
     )
     return utc.isoformat() + "+00:00"
+
+
+# Components of a date-time literal, split so a 1.1 value can be rewritten into
+# its TOML 1.0 spelling without changing the instant it denotes.
+_DATETIME_PARTS = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})"
+    r"(?P<sep>[Tt ])"
+    r"(?P<hour>\d{2}:\d{2})"
+    r"(?P<second>:\d{2})?"
+    r"(?P<fraction>\.\d+)?"
+    r"(?P<tz>[Zz]|\+\d{2}:\d{2}|-\d{2}:\d{2})?"
+    r"$"
+)
+
+_TIME_PARTS = re.compile(
+    r"^(?P<hour>\d{2}:\d{2})"
+    r"(?P<second>:\d{2})?"
+    r"(?P<fraction>\.\d+)?"
+    r"(?P<tz>[Zz]|\+\d{2}:\d{2}|-\d{2}:\d{2})?"
+    r"$"
+)
+
+
+def _downgrade_datetime_raw(raw: str) -> str:
+    """Rewrite a TOML 1.1 date-time literal into TOML 1.0 form.
+
+    The two 1.1 relaxations for date-times are an omitted seconds field and
+    (only at parse time) an offset on a *local* time, which is a separate
+    :class:`Time` item. Date-times keep their offset in 1.0, so this only
+    restores the seconds and canonicalises the date/time separator to ``T``;
+    the instant is unchanged.
+    """
+    m = _DATETIME_PARTS.match(raw)
+    if m is None or m.group("second"):
+        return raw
+    date = m.group("date")
+    rest = m.group("fraction") or ""
+    rest += m.group("tz") or ""
+    return f"{date}T{m.group('hour')}:00{rest}"
+
+
+def _downgrade_time_raw(raw: str) -> str:
+    """Rewrite a TOML 1.1 local-time literal into TOML 1.0 form.
+
+    TOML 1.0 requires the seconds field, so a truncated ``HH:MM`` gains
+    ``:00``. An offset-time is rejected before this is called because a
+    date-less value cannot carry an offset in 1.0.
+    """
+    m = _TIME_PARTS.match(raw)
+    if m is None or m.group("second"):
+        return raw
+    return f"{m.group('hour')}:00{m.group('fraction') or ''}"
 
 
 # A carriage return that is not the CR of a CRLF line ending. Inside a multiline
@@ -461,8 +552,23 @@ class Key(abc.ABC):
         """Check if the key contains multiple keys"""
         return len(self._keys) > 1
 
-    def as_string(self) -> str:
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
         """The TOML representation"""
+        if version != TOMLVersion.V1_0:
+            return self._original
+        if getattr(self, "t", None) is KeyType.Basic:
+            # A quoted key follows the same escaping rules as a basic string.
+            # The original text may carry surrounding whitespace, so rewrite
+            # only between the first and last quote.
+            original = self._original
+            start = original.find('"')
+            end = original.rfind('"')
+            if 0 <= start < end:
+                inner = downgrade_v11_escapes(original[start + 1 : end])
+                return original[: start + 1] + inner + original[end:]
+        if self.is_multi():
+            # A dotted key path may mix bare and quoted fragments.
+            return downgrade_v11_key_path(self._original)
         return self._original
 
     def __str__(self) -> str:
@@ -564,7 +670,7 @@ class Item:
     def discriminant(self) -> int:
         raise NotImplementedError()
 
-    def as_string(self) -> str:
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
         """The TOML representation"""
         raise NotImplementedError()
 
@@ -650,7 +756,7 @@ class Whitespace(Item):
         """If the whitespace is fixed, it can't be merged or discarded from the output."""
         return self._fixed
 
-    def as_string(self) -> str:
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
         return self._s
 
     def __repr__(self) -> str:
@@ -669,7 +775,7 @@ class Comment(Item):
     def discriminant(self) -> int:
         return 1
 
-    def as_string(self) -> str:
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
         return (
             f"{self._trivia.indent}{decode(self._trivia.comment)}{self._trivia.trail}"
         )
@@ -712,7 +818,7 @@ class Integer(Item, _CustomInt):
         """The wrapped integer value"""
         return self
 
-    def as_string(self) -> str:
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
         return self._raw
 
     def _new(self, result: int) -> Integer:
@@ -935,7 +1041,7 @@ class Float(Item, _CustomFloat):
         """The wrapped float value"""
         return self
 
-    def as_string(self) -> str:
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
         return self._raw
 
     def _new(self, result: float) -> Float:
@@ -1087,7 +1193,7 @@ class Bool(Item):
         """The wrapped boolean value"""
         return self._value
 
-    def as_string(self) -> str:
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
         return str(self._value).lower()
 
     def _getstate(self, protocol: int = 3) -> tuple[bool, Trivia]:
@@ -1191,7 +1297,9 @@ class DateTime(Item, datetime):
     def value(self) -> datetime:
         return self
 
-    def as_string(self) -> str:
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
+        if version == TOMLVersion.V1_0:
+            return _downgrade_datetime_raw(self._raw)
         return self._raw
 
     def __add__(self, other: timedelta) -> DateTime:
@@ -1320,7 +1428,7 @@ class Date(Item, date):
     def value(self) -> date:
         return self
 
-    def as_string(self) -> str:
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
         return self._raw
 
     def __add__(self, other: timedelta) -> Date:
@@ -1405,7 +1513,16 @@ class Time(Item, time):
     def value(self) -> time:
         return self
 
-    def as_string(self) -> str:
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
+        if version == TOMLVersion.V1_0:
+            if self.tzinfo is not None:
+                # An offset-time has no TOML 1.0 spelling: a local time may
+                # not carry an offset and converting it to a date-time would
+                # invent a date that was not part of the input value.
+                raise OutputVersionError(
+                    f"the offset-time {self._raw!r} (a local time with an offset)"
+                )
+            return _downgrade_time_raw(self._raw)
         return self._raw
 
     def replace(self, *args: object, **kwargs: object) -> Time:
@@ -1563,10 +1680,35 @@ class Array(Item, _CustomList):  # type: ignore[type-arg]
 
         return self
 
-    def as_string(self) -> str:
+    def _as_single_line_string(self, version: TOMLVersion) -> str:
+        """Collapse a multiline array onto one line for TOML 1.0 inline use.
+
+        Line breaks and comments are structural trivia a single-line 1.0
+        array cannot hold, so only the values and their separators remain.
+        """
+        values = [
+            group.value
+            for group in self._value
+            if group.value is not None and not isinstance(group.value, Null)
+        ]
+        return (
+            "[" + ", ".join(_render_single_line(v, version) for v in values) + "]"
+        )
+
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
         if not self._multiline or not self._value:
+            inner = ""
             rendered = list(self._iter_items())
-            inner = "".join(v.as_string() for v in rendered)
+            for v in rendered:
+                try:
+                    inner += v.as_string(version=version)
+                except OutputVersionError as ex:
+                    if ex.line is None or ex.col is None:
+                        line, col = _position_in_text("[" + inner)
+                        raise OutputVersionError(
+                            ex.feature, line=line, col=col
+                        ) from None
+                    raise
             if rendered and isinstance(rendered[-1], Comment):
                 # A trailing comment (e.g. from add_line(comment=...)) carries
                 # no newline, so keep the closing bracket off the comment line
@@ -1578,7 +1720,7 @@ class Array(Item, _CustomList):  # type: ignore[type-arg]
         s += "".join(
             self.trivia.indent
             + " " * 4
-            + v.value.as_string()
+            + v.value.as_string(version=version)
             + ("," if not isinstance(v.value, Null) else "")
             + (v.comment.as_string() if v.comment is not None else "")
             + "\n"
@@ -2080,8 +2222,8 @@ class Table(AbstractTable):
                 return False
         return True
 
-    def as_string(self) -> str:
-        return self._value.as_string()
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
+        return self._value.as_string(version=version)
 
     # Helpers
 
@@ -2167,7 +2309,81 @@ class InlineTable(AbstractTable):
         if isinstance(_item, Table):
             raise ValueError("Inline tables cannot contain a table")
 
-    def as_string(self) -> str:
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
+        if version == TOMLVersion.V1_0 and self._needs_v10_rewrite():
+            return self._as_single_line_string(TOMLVersion.V1_0)
+        return self._as_string(version)
+
+    def _is_multiline(self) -> bool:
+        """Whether the table's original layout spans more than one line.
+
+        TOML 1.0 inline tables must fit on one line, so any line break in
+        the whitespace/comments held by the container marks a 1.1 layout.
+        """
+        for k, v in self._value.body:
+            if k is None and isinstance(v, Whitespace) and "\n" in v.s:
+                return True
+            if k is None and isinstance(v, Comment) and "\n" in v.trivia.trail:
+                return True
+        return False
+
+    def _needs_v10_rewrite(self) -> bool:
+        """Whether the table uses layout a TOML 1.0 inline table cannot hold.
+
+        That is either a line break/comment inside the braces, or a trailing
+        comma after the last key -- both are TOML 1.1 relaxations.
+        """
+        if self._is_multiline():
+            return True
+        last_key_idx = max(
+            (i for i, (k, _v) in enumerate(self._value.body) if k is not None),
+            default=-1,
+        )
+        return any(
+            i > last_key_idx
+            and isinstance(v, Whitespace)
+            and "," in v.s
+            for i, (k, v) in enumerate(self._value.body)
+        )
+
+    def _as_single_line_string(self, version: TOMLVersion) -> str:
+        """Render a TOML 1.1 multiline inline table as a TOML 1.0 one-liner.
+
+        Line breaks and the comments that can only live on their own lines
+        are dropped (a comment can never survive being pulled onto another
+        line without changing the document text, so it is discarded), and
+        separator spacing is normalised to ``, ``. Values are recursively
+        downgraded: nested multiline inline tables flatten onto one line and
+        multiline arrays collapse, since a TOML 1.0 inline table must not
+        contain a line break at any depth.
+        """
+        parts: list[str] = []
+        for k, v in self._value.body:
+            if k is None:
+                continue
+            try:
+                if isinstance(v, Table):
+                    rendered = ", ".join(self._render_dotted(k, v, version))
+                else:
+                    rendered_value = _render_single_line(v, version)
+                    rendered = (
+                        f"{k.as_string(version=version)}"
+                        f"{'.' if k.is_dotted() else ''}"
+                        f"{k.sep}{rendered_value}"
+                    )
+            except OutputVersionError as ex:
+                if ex.line is None or ex.col is None:
+                    # Locate the failing pair at the start of its flattened line.
+                    prefix = "{" + ", ".join(parts)
+                    line, col = _position_in_text(prefix)
+                    raise OutputVersionError(
+                        ex.feature, line=line, col=col
+                    ) from None
+                raise
+            parts.append(rendered)
+        return "{" + ", ".join(parts) + "}"
+
+    def _as_string(self, version: TOMLVersion | None) -> str:
         buf = "{"
         emitted_key = False
         needs_separator = False
@@ -2248,12 +2464,12 @@ class InlineTable(AbstractTable):
                 # A table materialized from a dotted key renders one
                 # `prefix.child = value` pair per child, so that keys added
                 # after parsing stay attached to the dotted prefix.
-                rendered = ", ".join(self._render_dotted(k, v))
+                rendered = ", ".join(self._render_dotted(k, v, version))
             else:
                 rendered = (
-                    f"{k.as_string() + ('.' if k.is_dotted() else '')}"
+                    f"{k.as_string(version=version) + ('.' if k.is_dotted() else '')}"
                     f"{k.sep}"
-                    f"{v.as_string()}"
+                    f"{_render_inline_value(v, version)}"
                 )
             buf += f"{v.trivia.indent}{rendered}"
             last_value_end = len(buf)
@@ -2276,26 +2492,32 @@ class InlineTable(AbstractTable):
 
         return buf
 
-    def _render_dotted(self, key: Key, table: Table) -> list[str]:
+    def _render_dotted(
+        self, key: Key, table: Table, version: TOMLVersion | None = None
+    ) -> list[str]:
         """Render a table materialized from a dotted key as a list of
         ``prefix.child = value`` strings, recursing into nested dotted
         children."""
-        prefix = f"{key.as_string()}.{key.sep}"
+        prefix = f"{key.as_string(version=version)}.{key.sep}"
         parts = []
         for k, v in table.value.body:
             if k is None:
                 continue
             if isinstance(v, Table):
-                parts.extend(f"{prefix}{sub}" for sub in self._render_dotted(k, v))
+                parts.extend(
+                    f"{prefix}{sub}" for sub in self._render_dotted(k, v, version)
+                )
             else:
                 trail = v.trivia.trail.replace("\n", "")
                 parts.append(
-                    f"{prefix}{v.trivia.indent}{k.as_string()}{k.sep}{v.as_string()}"
+                    f"{prefix}{v.trivia.indent}"
+                    f"{k.as_string(version=version)}{k.sep}"
+                    f"{_render_inline_value(v, version)}"
                     f"{v.trivia.comment_ws}{v.trivia.comment}{trail}"
                 )
         if not parts:
             # every key under the prefix was removed, keep it as an empty table
-            return [f"{key.as_string()} = {{}}"]
+            return [f"{key.as_string(version=version)} = {{}}"]
         return parts
 
     def __setitem__(self, key: Key | str, value: Any) -> None:
@@ -2340,8 +2562,13 @@ class String(str, Item):
     def value(self) -> str:
         return self
 
-    def as_string(self) -> str:
-        return f"{self._t.value}{decode(self._original)}{self._t.value}"
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
+        original = decode(self._original)
+        if version == TOMLVersion.V1_0 and self._t.is_basic():
+            # ``\e`` and ``\xHH`` are TOML 1.1-only; spell the same scalar
+            # values with the universally understood ``\u`` form for 1.0.
+            original = downgrade_v11_escapes(original)
+        return f"{self._t.value}{original}{self._t.value}"
 
     @property
     def type(self) -> StringType:
@@ -2490,10 +2717,10 @@ class AoT(Item, _CustomList):  # type: ignore[type-arg]
             if hasattr(child, "invalidate_display_name"):
                 child.invalidate_display_name()
 
-    def as_string(self) -> str:
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
         b = ""
         for table in self._body:
-            b += table.as_string()
+            b += table.as_string(version=version)
 
         return b
 
@@ -2523,7 +2750,7 @@ class Null(Item):
     def value(self) -> None:
         return None
 
-    def as_string(self) -> str:
+    def as_string(self, *, version: TOMLVersion | None = None) -> str:
         return ""
 
     def _getstate(self, protocol: int = 3) -> tuple[()]:
