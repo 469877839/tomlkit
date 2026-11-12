@@ -5,6 +5,7 @@ from tomlkit.api import boolean
 from tomlkit.api import comment
 from tomlkit.api import date
 from tomlkit.api import datetime
+from tomlkit.api import decimal_
 from tomlkit.api import document
 from tomlkit.api import dump
 from tomlkit.api import dumps
@@ -36,6 +37,7 @@ __all__ = [
     "comment",
     "date",
     "datetime",
+    "decimal_",
     "document",
     "dump",
     "dumps",

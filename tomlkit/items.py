@@ -16,6 +16,7 @@ from datetime import datetime
 from datetime import time
 from datetime import timedelta
 from datetime import tzinfo
+from decimal import Decimal
 from enum import Enum
 from typing import TYPE_CHECKING
 from typing import Any
@@ -61,6 +62,12 @@ def item(value: int, _parent: Item | None = ..., _sort_keys: bool = ...) -> Inte
 
 @overload
 def item(value: float, _parent: Item | None = ..., _sort_keys: bool = ...) -> Float: ...
+
+
+@overload
+def item(
+    value: Decimal, _parent: Item | None = ..., _sort_keys: bool = ...
+) -> DecimalFloat: ...
 
 
 @overload
@@ -261,6 +268,11 @@ def item(value: Any, _parent: Item | None = None, _sort_keys: bool = False) -> I
                         f"Custom encoder is expected to return an instance of Item, got {type(rv)}"
                     )
                 return rv
+
+        if isinstance(value, Decimal):
+            # Fallback only: a registered custom encoder gets the first
+            # chance at Decimal values so existing conversions keep working.
+            return DecimalFloat(value, Trivia(), DecimalFloat.format_literal(value))
 
     raise ConvertError(f"Unable to convert an object of {type(value)} to a TOML item")
 
@@ -1063,6 +1075,205 @@ class Float(Item, _CustomFloat):
     __trunc__ = float.__trunc__
     __ceil__ = float.__ceil__
     __floor__ = float.__floor__
+
+
+class DecimalFloat(Item, Decimal):  # type: ignore[misc]
+    """
+    A float literal stored as a :class:`decimal.Decimal`.
+
+    Unlike :class:`Float`, the value keeps the exact decimal precision of
+    the literal it was parsed from (or constructed with), so reading a
+    threshold like ``0.1`` does not introduce binary floating point error.
+
+    Arithmetic stays in decimal: operations with ``int`` or
+    ``Decimal`` operands produce another ``DecimalFloat``, while mixing
+    with a binary ``float`` raises ``TypeError`` instead of silently
+    converting to a lower-precision representation. Comparisons against
+    ``float`` values follow the stdlib ``Decimal`` rules (exact
+    comparison, so ``DecimalFloat(0.1) != 0.1``).
+    """
+
+    def __new__(cls, value: Decimal | str, trivia: Trivia, raw: str) -> DecimalFloat:
+        return Decimal.__new__(cls, value)
+
+    def __init__(self, value: Decimal | str, trivia: Trivia, raw: str) -> None:
+        super().__init__(trivia)
+        self._original = Decimal(value)
+        self._raw = raw
+        self._sign = False
+
+        if re.match(r"^[+\-].+$", raw):
+            self._sign = True
+
+    def unwrap(self) -> Decimal:
+        return self._original
+
+    __hash__ = Decimal.__hash__
+
+    @property
+    def discriminant(self) -> int:
+        return 13
+
+    @property
+    def value(self) -> Decimal:
+        """The wrapped decimal value"""
+        return self
+
+    def as_string(self) -> str:
+        return self._raw
+
+    @staticmethod
+    def format_literal(value: Decimal) -> str:
+        """Render a Decimal as a valid TOML float literal.
+
+        Finite values keep their exact decimal digits (``str()`` of a
+        Decimal, lowercasing the exponent marker). A result without a
+        fractional part or exponent (e.g. ``Decimal("4.0") // 2``) gains a
+        ``.0`` suffix so the literal still parses back as a float, not an
+        integer. Non-finite values are written as the lowercase
+        ``inf``/``nan`` the TOML spec requires, preserving the sign of
+        ``-inf`` and ``-nan``.
+        """
+        if value.is_nan():
+            return "-nan" if value.is_signed() else "nan"
+        if value.is_infinite():
+            return "-inf" if value.is_signed() else "inf"
+        raw = str(value).replace("E", "e")
+        if "." not in raw and "e" not in raw:
+            raw += ".0"
+        return raw
+
+    def _new(self, result: Decimal) -> DecimalFloat:
+        raw = self.format_literal(result)
+
+        # -0.0 >= 0 is True, but its literal already carries its sign.
+        # Ordering a NaN raises InvalidOperation, so skip the sign check then.
+        if (
+            self._sign
+            and not result.is_nan()
+            and result >= 0
+            and not raw.startswith("-")
+        ):
+            raw = f"+{raw}"
+
+        return DecimalFloat(result, self._trivia.copy(), raw)
+
+    def _getstate(self, protocol: int = 3) -> tuple[Decimal, Trivia, str]:
+        return self._original, self._trivia, self._raw
+
+    # Decimal methods — explicit typed wrappers
+    def __abs__(self) -> DecimalFloat:
+        return self._new(Decimal.__abs__(self))
+
+    def __add__(self, other: object) -> DecimalFloat:
+        result = Decimal.__add__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    __eq__ = Decimal.__eq__
+
+    def __floordiv__(self, other: object) -> DecimalFloat:
+        result = Decimal.__floordiv__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    __le__ = Decimal.__le__
+    __lt__ = Decimal.__lt__
+
+    def __mod__(self, other: object) -> DecimalFloat:
+        result = Decimal.__mod__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __mul__(self, other: object) -> DecimalFloat:
+        result = Decimal.__mul__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __neg__(self) -> DecimalFloat:
+        return self._new(Decimal.__neg__(self))
+
+    def __pos__(self) -> DecimalFloat:
+        return self._new(Decimal.__pos__(self))
+
+    def __pow__(self, other: object, mod: Any = None) -> DecimalFloat:
+        result = Decimal.__pow__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __radd__(self, other: object) -> DecimalFloat:
+        result = Decimal.__radd__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __rfloordiv__(self, other: object) -> DecimalFloat:
+        result = Decimal.__rfloordiv__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __rmod__(self, other: object) -> DecimalFloat:
+        result = Decimal.__rmod__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __rmul__(self, other: object) -> DecimalFloat:
+        result = Decimal.__rmul__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    @overload
+    def __round__(self, ndigits: None = None) -> Integer: ...
+
+    @overload
+    def __round__(self, ndigits: SupportsIndex) -> DecimalFloat: ...
+
+    def __round__(self, ndigits: SupportsIndex | None = None) -> Integer | DecimalFloat:
+        if ndigits is None:
+            return Integer._new(self, Decimal.__round__(self))  # type: ignore[arg-type]
+        return self._new(Decimal.__round__(self, int(ndigits)))
+
+    def __rpow__(self, other: object, mod: Any = None) -> DecimalFloat:
+        result = Decimal.__rpow__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __rtruediv__(self, other: object) -> DecimalFloat:
+        result = Decimal.__rtruediv__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __truediv__(self, other: object) -> DecimalFloat:
+        result = Decimal.__truediv__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __sub__(self, other: object) -> DecimalFloat:
+        result = Decimal.__sub__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    def __rsub__(self, other: object) -> DecimalFloat:
+        result = Decimal.__rsub__(self, other)  # type: ignore[operator]
+        if result is NotImplemented:
+            return result  # type: ignore[return-value]
+        return self._new(result)
+
+    __trunc__ = Decimal.__trunc__
+    __ceil__ = Decimal.__ceil__
+    __floor__ = Decimal.__floor__
 
 
 class Bool(Item):

@@ -26,6 +26,40 @@ the content of TOML files and strings::
     # as the original string
     >>> assert dumps(doc) == content
 
+Reading floats as decimals
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default, float literals are read as binary ``float``, which cannot
+represent most decimal fractions exactly. When a document holds decimal
+thresholds or other values where that rounding matters, pass
+``parse_float=decimal.Decimal`` (mirroring ``tomllib``) to read them as
+exact ``Decimal`` values instead::
+
+    >>> from decimal import Decimal
+    >>> from tomlkit import parse
+
+    >>> doc = parse("threshold = 0.1\n", parse_float=Decimal)
+    >>> type(doc["threshold"]).__name__
+    'DecimalFloat'
+    >>> doc["threshold"].unwrap()
+    Decimal('0.1')
+
+    # arithmetic stays decimal and exact
+    >>> doc["threshold"] = doc["threshold"] + Decimal("0.2")
+    >>> print(dumps(doc), end="")
+    threshold = 0.3
+
+    # unmodified values keep their original text
+    >>> doc = parse("threshold = 1_000.25\n", parse_float=Decimal)
+    >>> dumps(doc)
+    'threshold = 1_000.25\n'
+
+Mixing a decimal float with a binary ``float`` raises ``TypeError`` rather
+than silently losing precision; ``int`` and ``Decimal`` operands are
+supported. Comparisons against ``float`` follow the stdlib ``Decimal``
+rules, so ``DecimalFloat("0.1") != 0.1``. The default behavior is
+unchanged when ``parse_float`` is not given.
+
 
 Modifying
 ---------

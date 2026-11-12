@@ -4,6 +4,8 @@ import datetime
 import re
 import string
 
+from decimal import Decimal
+from decimal import InvalidOperation
 from typing import Any
 from typing import Callable
 
@@ -32,6 +34,7 @@ from tomlkit.items import BoolType
 from tomlkit.items import Comment
 from tomlkit.items import Date
 from tomlkit.items import DateTime
+from tomlkit.items import DecimalFloat
 from tomlkit.items import Float
 from tomlkit.items import InlineTable
 from tomlkit.items import Integer
@@ -100,9 +103,16 @@ class Parser:
     # adds a level of nested containers. Refuse documents beyond this depth.
     MAX_NESTING_DEPTH = 100
 
-    def __init__(self, string: str | bytes) -> None:
+    def __init__(
+        self, string: str | bytes, parse_float: Callable[[str], Any] | None = None
+    ) -> None:
         # Input to parse
         self._src = Source(decode(string))
+
+        # Strategy for reading float literals. ``None`` keeps the default
+        # ``float``; ``decimal.Decimal`` (or any callable taking the float
+        # literal as a string) selects an alternative representation.
+        self._parse_float = parse_float
 
         self._aot_stack: list[Key] = []
         self._nesting_depth = 0
@@ -797,12 +807,42 @@ class Parser:
         # count exceeds Python's int-from-string conversion limit also raises
         # ValueError above; it must be rejected, not silently coerced to inf.
         if base == 10 and ("." in clean or "e" in clean or clean in ("inf", "nan")):
+            return self._parse_float_literal(sign + raw, sign + clean, trivia)
+
+        return None
+
+    def _parse_float_literal(
+        self, literal: str, cleaned: str, trivia: Trivia
+    ) -> Item | None:
+        if self._parse_float is None:
             try:
-                return Float(float(sign + clean), trivia, sign + raw)
+                return Float(float(cleaned), trivia, literal)
             except ValueError:
                 return None
 
-        return None
+        if self._parse_float is Decimal:
+            # The stdlib Decimal constructor accepts the full TOML float
+            # grammar, including underscores, exponents, signs and inf/nan.
+            # A malformed literal raises InvalidOperation (an ArithmeticError,
+            # not a ValueError), so it is turned into the same parse error the
+            # default float strategy produces instead of leaking out.
+            try:
+                return DecimalFloat(Decimal(literal), trivia, literal)
+            except InvalidOperation:
+                return None
+
+        value = self._parse_float(literal)
+        if isinstance(value, Item):
+            return value
+        if isinstance(value, Decimal):
+            return DecimalFloat(value, trivia, literal)
+        if isinstance(value, float):
+            return Float(value, trivia, literal)
+
+        raise TypeError(
+            "parse_float must return a float, a decimal.Decimal or a TOML item, "
+            f"got {type(value).__name__}"
+        )
 
     def _parse_literal_string(self) -> String:
         with self._state:

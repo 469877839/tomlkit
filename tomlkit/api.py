@@ -4,8 +4,11 @@ import contextlib
 import datetime as _datetime
 import re
 
+from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Mapping
+from decimal import Decimal
+from decimal import InvalidOperation
 from typing import IO
 from typing import TYPE_CHECKING
 from typing import Any
@@ -22,6 +25,7 @@ from tomlkit.items import Bool
 from tomlkit.items import Comment
 from tomlkit.items import Date
 from tomlkit.items import DateTime
+from tomlkit.items import DecimalFloat
 from tomlkit.items import DottedKey
 from tomlkit.items import Float
 from tomlkit.items import InlineTable
@@ -46,13 +50,15 @@ if TYPE_CHECKING:
     E = TypeVar("E", bound=Encoder)
 
 
-def loads(string: str | bytes) -> TOMLDocument:
+def loads(
+    string: str | bytes, *, parse_float: Callable[[str], Any] | None = None
+) -> TOMLDocument:
     """
     Parses a string into a TOMLDocument.
 
     Alias for parse().
     """
-    return parse(string)
+    return parse(string, parse_float=parse_float)
 
 
 def dumps(data: Mapping[str, Any], sort_keys: bool = False) -> str:
@@ -79,11 +85,13 @@ def dumps(data: Mapping[str, Any], sort_keys: bool = False) -> str:
         raise TypeError(msg) from ex
 
 
-def load(fp: IO[str] | IO[bytes]) -> TOMLDocument:
+def load(
+    fp: IO[str] | IO[bytes], *, parse_float: Callable[[str], Any] | None = None
+) -> TOMLDocument:
     """
     Load toml document from a file-like object.
     """
-    return parse(fp.read())
+    return parse(fp.read(), parse_float=parse_float)
 
 
 def dump(data: Mapping[str, Any], fp: IO[str], *, sort_keys: bool = False) -> None:
@@ -101,11 +109,21 @@ def dump(data: Mapping[str, Any], fp: IO[str], *, sort_keys: bool = False) -> No
     fp.write(dumps(data, sort_keys=sort_keys))
 
 
-def parse(string: str | bytes) -> TOMLDocument:
+def parse(
+    string: str | bytes, *, parse_float: Callable[[str], Any] | None = None
+) -> TOMLDocument:
     """
     Parses a string or bytes into a TOMLDocument.
+
+    :param parse_float: strategy used to read float literals. ``None`` (the
+        default) reads them as binary ``float``, preserving the historical
+        behavior. Pass ``decimal.Decimal`` to read them as exact
+        :class:`decimal.Decimal` values wrapped in
+        :class:`~tomlkit.items.DecimalFloat`; any other callable receives the
+        float literal as a string and must return a ``float``, a
+        ``Decimal`` or a TOML item. Integer literals are unaffected.
     """
-    return Parser(string).parse()
+    return Parser(string, parse_float=parse_float).parse()
 
 
 def document() -> TOMLDocument:
@@ -149,6 +167,26 @@ def integer(raw: str | int) -> Integer:
 def float_(raw: str | float) -> Float:
     """Create an float item from a number or string."""
     return item(float(raw))
+
+
+def decimal_(raw: str | Decimal) -> DecimalFloat:
+    """Create an exact decimal float item from a number or string.
+
+    A string must be a valid TOML v1.0.0 float literal; its text is kept
+    verbatim (including underscores and exponents) until the item is
+    modified, so values assigned back into a document stay exact. Anything
+    else raises ``ValueError``.
+    """
+    if isinstance(raw, Decimal):
+        value = raw
+        literal = DecimalFloat.format_literal(raw)
+    else:
+        try:
+            value = Decimal(raw)
+        except InvalidOperation:
+            raise ValueError(f"Invalid TOML float: {raw!r}") from None
+        literal = raw
+    return DecimalFloat(value, Trivia(), literal)
 
 
 def boolean(raw: str | bool) -> Bool:
@@ -209,8 +247,13 @@ def datetime(raw: str) -> DateTime:
     return item(value)
 
 
-def array(raw: str = "[]") -> Array:
+def array(
+    raw: str = "[]", *, parse_float: Callable[[str], Any] | None = None
+) -> Array:
     """Create an array item for its string representation.
+
+    :param parse_float: strategy used to read float literals, see
+        :func:`parse`.
 
     :Example:
 
@@ -221,7 +264,7 @@ def array(raw: str = "[]") -> Array:
     >>> a
     [1, 2, 3]
     """
-    v = value(raw)
+    v = value(raw, parse_float=parse_float)
     if not isinstance(v, Array):
         raise ValueError(f"Expected an array, got {type(v)}")
     return v
@@ -297,8 +340,11 @@ def key(k: str | Iterable[str]) -> Key:
     return DottedKey(keys)
 
 
-def value(raw: str) -> _Item:
+def value(raw: str, *, parse_float: Callable[[str], Any] | None = None) -> _Item:
     """Parse a simple value from a string.
+
+    :param parse_float: strategy used to read float literals, see
+        :func:`parse`.
 
     :Example:
 
@@ -309,25 +355,30 @@ def value(raw: str) -> _Item:
     >>> value("[1, 2, 3]")
     [1, 2, 3]
     """
-    parser = Parser(raw)
+    parser = Parser(raw, parse_float=parse_float)
     v = parser._parse_value()
     if not parser.end():
         raise parser.parse_error(UnexpectedCharError, char=parser._current)
     return v
 
 
-def key_value(src: str) -> tuple[Key, _Item]:
+def key_value(
+    src: str, *, parse_float: Callable[[str], Any] | None = None
+) -> tuple[Key, _Item]:
     """Parse a key-value pair from a string.
 
     Anything other than whitespace or a comment after the pair is an error,
     as it is when the same text is given to :func:`parse`.
+
+    :param parse_float: strategy used to read float literals, see
+        :func:`parse`.
 
     :Example:
 
     >>> key_value("foo = 1")
     (Key('foo'), 1)
     """
-    parser = Parser(src)
+    parser = Parser(src, parse_float=parse_float)
     k, v = parser._parse_key_value(parse_comment=True)
     if not parser.end():
         raise parser.parse_error(UnexpectedCharError, char=parser._current)

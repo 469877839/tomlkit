@@ -1,7 +1,9 @@
 import os
 import re
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
+from typing import Any
 
 from tomlkit.api import loads
 from tomlkit.toml_document import TOMLDocument
@@ -26,8 +28,14 @@ class TOMLFile:
         self._path = path
         self._linesep: str = os.linesep
 
-    def read(self) -> TOMLDocument:
-        """Read the file content as a :class:`tomlkit.toml_document.TOMLDocument`."""
+    def read(
+        self, *, parse_float: Callable[[str], Any] | None = None
+    ) -> TOMLDocument:
+        """Read the file content as a :class:`tomlkit.toml_document.TOMLDocument`.
+
+        :param parse_float: strategy used to read float literals, see
+            :func:`tomlkit.parse`.
+        """
         with open(self._path, encoding="utf-8", newline="") as f:
             content = f.read()
 
@@ -43,7 +51,7 @@ class TOMLFile:
                 else:
                     self._linesep = "mixed"
 
-            return loads(content)
+            return loads(content, parse_float=parse_float)
 
     def write(self, data: TOMLDocument) -> None:
         """Write the TOMLDocument to the file."""

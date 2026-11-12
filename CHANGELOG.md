@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add an opt-in exact decimal float reading strategy: `parse()`, `loads()`, `load()`, `TOMLFile.read()`, `value()`, `array()` and `key_value()` accept a `parse_float` keyword (mirroring `tomllib`). Pass `decimal.Decimal` to read float literals as `tomlkit.items.DecimalFloat` (backed by the stdlib `decimal.Decimal`) instead of binary `float`, keeping the exact precision of values like `0.1`, `5e-300` or `1e400`. The default behavior is unchanged; unmodified literals keep their original text (including underscores, exponents, negative zero and `inf`/`nan`), modified values are regenerated as valid TOML floats, arithmetic with `int`/`Decimal` stays exact, and mixing in a binary `float` raises `TypeError` instead of silently losing precision. A new `tomlkit.decimal_()` helper and `Decimal` support in `item()` (after custom encoders) backfill decimal values into documents.
+
 ### Changed
 
 - Speed up repeated array appends by keeping existing indexes instead of rebuilding them.
