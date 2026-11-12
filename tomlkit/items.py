@@ -619,6 +619,20 @@ class Item:
     def __reduce_ex__(self, protocol: int) -> tuple[type, tuple[object, ...]]:  # type: ignore[override]
         return self.__class__, self._getstate(protocol)
 
+    def __copy__(self) -> Item:
+        # ``_getstate`` keeps the live ``Trivia`` object, so the default
+        # reduce-based shallow copy would share it and let a comment or indent
+        # edit on one copy rewrite the item still stored in the original
+        # document. Rebuild with an independent trivia; nested items keep their
+        # normal shallow-copy semantics.
+        state = self._getstate()
+        return self.__class__(
+            *(
+                value.copy() if isinstance(value, Trivia) else value
+                for value in state
+            )
+        )
+
 
 class Whitespace(Item):
     """
@@ -2156,7 +2170,12 @@ class InlineTable(AbstractTable):
         self._value.append(key, _item)
 
         if isinstance(key, Key):
-            key = key.key
+            # Container.append resolves a dotted key to its head key (and a
+            # nested super table), so the mapping view must use the head as
+            # well: registering the full dotted string here would leave the
+            # dict view disagreeing with the container's key map.
+            key = next(iter(key)).key
+            _item = self._value[key]
 
         if key is not None:
             dict.__setitem__(self, key, _item)
@@ -2166,6 +2185,12 @@ class InlineTable(AbstractTable):
     def _validate_child(self, _item: Item) -> None:
         if isinstance(_item, Table):
             raise ValueError("Inline tables cannot contain a table")
+        if isinstance(_item, Comment) and _item.trivia.trail:
+            # A comment only ends at a newline, which would terminate the
+            # inline table before its closing `}` and make the output
+            # unparsable. Comments recovered from a lenient parse carry no
+            # trail and keep rendering as-is.
+            raise ValueError("Inline tables cannot contain a comment")
 
     def as_string(self) -> str:
         buf = "{"
@@ -2280,7 +2305,10 @@ class InlineTable(AbstractTable):
         """Render a table materialized from a dotted key as a list of
         ``prefix.child = value`` strings, recursing into nested dotted
         children."""
-        prefix = f"{key.as_string()}.{key.sep}"
+        # `key.sep` separates a key from its value, not the parts of a dotted
+        # key: a programmatically built ``dot`` key defaults to ``" = "`` and
+        # would otherwise render as ``dot. = child = value``.
+        prefix = f"{key.as_string()}."
         parts = []
         for k, v in table.value.body:
             if k is None:
@@ -2288,9 +2316,13 @@ class InlineTable(AbstractTable):
             if isinstance(v, Table):
                 parts.extend(f"{prefix}{sub}" for sub in self._render_dotted(k, v))
             else:
+                # A child's indent is the spacing before its own key. It is
+                # already expressed by the comma/whitespace entries that
+                # precede the dotted group, so emitting it after the ``.``
+                # would produce ``dot. child``.
                 trail = v.trivia.trail.replace("\n", "")
                 parts.append(
-                    f"{prefix}{v.trivia.indent}{k.as_string()}{k.sep}{v.as_string()}"
+                    f"{prefix}{k.as_string()}{k.sep}{v.as_string()}"
                     f"{v.trivia.comment_ws}{v.trivia.comment}{trail}"
                 )
         if not parts:
@@ -2444,9 +2476,19 @@ class AoT(Item, _CustomList):  # type: ignore[type-arg]
 
     def __setitem__(self, key: slice | int, value: Any) -> None:  # type: ignore[override]
         if isinstance(key, slice):
-            value = [item(v, _parent=self) for v in value]
+            converted = [item(v, _parent=self) for v in value]
+            for element in converted:
+                if not isinstance(element, Table):
+                    raise ValueError(
+                        f"Unsupported array-of-tables value type: {type(element)}"
+                    )
+            value = converted
         else:
             value = item(value, _parent=self)
+            if not isinstance(value, Table):
+                raise ValueError(
+                    f"Unsupported array-of-tables value type: {type(value)}"
+                )
         self._body[key] = value
         list.__setitem__(self, key, value)
 

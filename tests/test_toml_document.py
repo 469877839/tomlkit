@@ -1658,12 +1658,15 @@ name = "bar-a-c"
 """
     doc = parse(content)
     del doc["bar"]["a"]
+    # `bar` still exists in the mapping (it is now an empty table), so its
+    # header must survive serialization instead of silently dropping the key.
     assert (
         doc.as_string()
         == """\
 [foo]
 name = "foo"
 
+[bar]
 [foo.a]
 name = "foo-a"
 
@@ -1672,6 +1675,8 @@ name = "baz"
 
 """
     )
+    assert parse(doc.as_string()).unwrap() == doc.unwrap()
+    assert doc.unwrap()["bar"] == {}
 
 
 def test_overwrite_out_of_order_table_key() -> None:

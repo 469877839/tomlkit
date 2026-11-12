@@ -20,6 +20,7 @@ from tomlkit.exceptions import NonExistentKey
 from tomlkit.exceptions import TOMLKitError
 from tomlkit.items import AoT
 from tomlkit.items import Comment
+from tomlkit.items import InlineTable
 from tomlkit.items import Item
 from tomlkit.items import Key
 from tomlkit.items import Null
@@ -37,14 +38,26 @@ def _is_empty_aot(item: Item) -> bool:
     return isinstance(item, AoT) and not item.body
 
 
-def _emits_header(key: Key, table: Table) -> bool:
+def _emits_header(key: Key, table: Table, fragment: bool = False) -> bool:
     """Whether rendering ``table`` under ``key`` emits a ``[header]`` line.
 
     A super table normally renders as nothing but the path prefix of its
-    children, so it opens no scope of its own.
+    children, so it opens no scope of its own. A table that has been emptied
+    (e.g. by deleting the last child of a dotted key) falls back to an
+    explicit header, otherwise the key would silently disappear from the
+    serialized document while staying in the mapping. That fallback does not
+    apply to an out-of-order fragment: the fragments of one key share a single
+    header, rendered by whichever part still has content.
     """
     return (
         not table.is_super_table()
+        or (
+            not fragment
+            and not any(
+                body_key is not None and not isinstance(body_item, Null)
+                for body_key, body_item in table.value.body
+            )
+        )
         or (
             any(
                 not isinstance(v, (Table, AoT, Whitespace, Null))
@@ -206,15 +219,57 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         assert not isinstance(key, Item)
         return self.append(key, item)
 
+    def _validate_dotted_key_path(
+        self, head: SingleKey, parts: list[SingleKey]
+    ) -> None:
+        """Validate every prefix of a dotted key against existing entries.
+
+        A dotted key only ever creates implicit (super) tables, so any prefix
+        that already renders as an explicit ``[header]`` would be declared
+        twice; a prefix that resolves to a value would be replaced by a table.
+        Raising before any mutation keeps the document untouched on rejection.
+        """
+        if head not in self._map:
+            return
+
+        container = self._container_for(head)
+        for part in parts[:-1]:
+            if part not in container._map:
+                return
+            container = self._container_for(part, container)
+
+    def _container_for(
+        self, key: Key, container: Container | None = None
+    ) -> Container:
+        """The prefix table's own container.
+
+        A dotted key may extend an implicit (super) table -- that is how
+        sibling dotted keys accumulate -- but it must not reopen a table that
+        renders its own ``[header]``, nor replace a value.
+        """
+        source = self if container is None else container
+        index = source._map[key]
+        if isinstance(index, tuple):
+            return OutOfOrderTableProxy(source, index)._internal_container
+        stored_key, item = source._body[index]
+        assert stored_key is not None
+        if not isinstance(item, Table) or _emits_header(stored_key, item):
+            raise TOMLKitError("Redefinition of an existing table")
+        return item.value
+
     def _handle_dotted_key(self, key: Key, value: Item) -> None:
         if isinstance(value, (Table, AoT)):
             raise TOMLKitError("Can't add a table to a dotted key")
         name, *mid, last = key
+        self._validate_dotted_key_path(name, [*mid, last])
         name._dotted = True
-        table = current = Table(Container(True), Trivia(), False, is_super_table=True)
+        # Non-parsing containers so later user edits use the strict placement
+        # rules (e.g. a table replaced by a value must move before following
+        # header-rendering siblings).
+        table = current = Table(Container(False), Trivia(), False, is_super_table=True)
         for _name in mid:
             _name._dotted = True
-            new_table = Table(Container(True), Trivia(), False, is_super_table=True)
+            new_table = Table(Container(False), Trivia(), False, is_super_table=True)
             current.append(_name, new_table)
             current = new_table
 
@@ -251,6 +306,14 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         return last_index + 1
 
     def _renders_table_header(self, table: Table) -> bool:
+        if not any(
+            body_key is not None and not isinstance(body_item, Null)
+            for body_key, body_item in table.value.body
+        ):
+            # An emptied table renders an explicit header of its own (see
+            # _emits_header), so anything appended after it would be captured
+            # by that header's scope.
+            return True
         for k, v in table.value.body:
             if isinstance(v, AoT):
                 return True
@@ -376,7 +439,12 @@ class Container(_CustomDict):  # type: ignore[type-arg]
                     return self
                 elif current.is_super_table():
                     if item.is_super_table():
-                        # We need to merge both super tables
+                        # We need to merge both super tables. A fragment that
+                        # renders its own ``[header]`` cannot join an
+                        # out-of-order key whose other parts already render
+                        # one: the output would declare the header twice.
+                        if not self._parsed and _emits_header(key, item):
+                            raise KeyAlreadyPresent(key)
                         if (
                             key.is_dotted()
                             or (
@@ -392,14 +460,30 @@ class Container(_CustomDict):  # type: ignore[type-arg]
 
                             if idx < len(self._body):
                                 self._insert_at(idx, key, item)
+                                added_idx, inserted = idx, True
                             else:
+                                added_idx, inserted = len(self._body), False
                                 self._raw_append(key, item)
 
                             if validate:
-                                self._validate_out_of_order_table(key)
+                                try:
+                                    self._validate_out_of_order_table(key)
+                                except Exception:
+                                    # The fragment is already in the body, so a
+                                    # rejected merge must roll back exactly the
+                                    # entry it added before propagating.
+                                    self._rollback_appended(
+                                        key, added_idx, inserted=inserted
+                                    )
+                                    raise
 
                             return self
 
+                        # Merging in place cannot be undone, so validate the
+                        # exact same append sequence on a throwaway copy first.
+                        assert isinstance(current, Table)
+                        if not self._parsed:
+                            self._validate_merge(current, item)
                         # Merge the new super table's body into the existing one
                         # in place. Previously this deep-copied `current` before
                         # appending, which is O(size of current) on every merge
@@ -435,6 +519,7 @@ class Container(_CustomDict):  # type: ignore[type-arg]
                     # preserve table ordering in the document.
                     assert isinstance(current, Table)
                     self._validate_table_candidate(current, item)
+                    self._validate_concrete_extension(key, item)
             elif isinstance(item, AoT):
                 if not isinstance(current, AoT):
                     # Tried to define an AoT after a table with the same name.
@@ -488,44 +573,14 @@ class Container(_CustomDict):  # type: ignore[type-arg]
 
         self._raw_append(key, item)
         if validate and key is not None:
-            self._validate_out_of_order_table(key)
+            try:
+                self._validate_out_of_order_table(key)
+            except Exception:
+                # _raw_append already registered the entry; a failed validation
+                # must leave no trace, so undo it before propagating.
+                self._rollback_appended(key, len(self._body) - 1)
+                raise
         return self
-
-    def _validate_table_candidate(self, current: Table, candidate: Table) -> None:
-        for k, v in candidate.value.body:
-            if k is None:
-                continue
-
-            if k in current.value._map:
-                existing = current.value.item(k)
-                if isinstance(existing, (Table, AoT)) != isinstance(v, (Table, AoT)):
-                    raise KeyAlreadyPresent(k)
-                if k.is_dotted() and not (
-                    isinstance(existing, Table) and existing.is_super_table()
-                ):
-                    raise TOMLKitError("Redefinition of an existing table")
-                if isinstance(existing, Table) and isinstance(v, Table):
-                    if not existing.is_super_table() and not v.is_super_table():
-                        # Both sides are concrete `[table]` definitions of the
-                        # same name; the table is declared twice.
-                        raise KeyAlreadyPresent(k)
-                    # One side is still an implicit/super table, so a duplicate
-                    # (if any) is nested deeper - keep checking the subtree.
-                    self._validate_table_candidate(existing, v)
-                continue
-
-            if not k.is_dotted():
-                # Even when the candidate key itself is not dotted, an
-                # existing dotted key may already use it as a prefix —
-                # e.g.  [a] b.c=1 then [a.b] d=2  (b prefixes b.c).
-                for existing_key in current.value._map:
-                    if existing_key.is_dotted() and next(iter(existing_key)) == k:
-                        raise TOMLKitError("Redefinition of an existing table")
-                continue
-
-            head = next(iter(k))
-            if head in current.value._map:
-                raise TOMLKitError("Redefinition of an existing table")
 
     def _raw_append(self, key: Key | None, item: Item) -> None:
         if key is not None and key in self._map:
@@ -659,12 +714,125 @@ class Container(_CustomDict):  # type: ignore[type-arg]
             return self._body[-1][1]
         return None
 
+    def _validate_table_candidate(self, current: Table, candidate: Table) -> None:
+        for k, v in candidate.value.body:
+            if k is None:
+                continue
+
+            if k in current.value._map:
+                existing = current.value.item(k)
+                if isinstance(existing, (Table, AoT)) != isinstance(v, (Table, AoT)):
+                    raise KeyAlreadyPresent(k)
+                if k.is_dotted() and not (
+                    isinstance(existing, Table) and existing.is_super_table()
+                ):
+                    raise TOMLKitError("Redefinition of an existing table")
+                if isinstance(existing, Table) and isinstance(v, Table):
+                    if not existing.is_super_table() and not v.is_super_table():
+                        # Both sides are concrete `[table]` definitions of the
+                        # same name; the table is declared twice.
+                        raise KeyAlreadyPresent(k)
+                    # One side is still an implicit/super table, so a duplicate
+                    # (if any) is nested deeper - keep checking the subtree.
+                    self._validate_table_candidate(existing, v)
+                continue
+
+            if not k.is_dotted():
+                # Even when the candidate key itself is not dotted, an
+                # existing dotted key may already use it as a prefix —
+                # e.g.  [a] b.c=1 then [a.b] d=2  (b prefixes b.c).
+                for existing_key in current.value._map:
+                    if existing_key.is_dotted() and next(iter(existing_key)) == k:
+                        raise TOMLKitError("Redefinition of an existing table")
+                continue
+
+            head = next(iter(k))
+            if head in current.value._map:
+                raise TOMLKitError("Redefinition of an existing table")
+
+    def _validate_merge(self, current: Table, candidate: Table) -> None:
+        """Check two super-table fragments can merge before mutating either.
+
+        The in-place merge cannot be undone, so replay the exact same append
+        sequence into a throwaway copy of the current table first; any key
+        conflict or type change raises there instead of leaving the live table
+        half-merged.
+        """
+        self._validate_table_candidate(current, candidate)
+        temp_table = Table(Container(False), Trivia(), False, is_super_table=True)
+        for body_key, body_item in current.value.body:
+            temp_table.value.append(body_key, copy.copy(body_item), validate=True)
+        for k, v in candidate.value.body:
+            temp_table.value.append(k, copy.deepcopy(v), validate=True)
+        temp_table.value._validate_out_of_order_table()
+
+    def _validate_concrete_extension(self, key: Key, candidate: Table) -> None:
+        """Check a super fragment extending a concrete header-bearing table.
+
+        A fragment that emits its own ``[key]`` header cannot join an existing
+        concrete table: the output would declare the header twice. Only a
+        headerless fragment (whose body is entirely tables) can extend it the
+        way the parser nests ``[a.b]`` under an existing ``[a]``.
+        """
+        if _emits_header(key, candidate):
+            raise KeyAlreadyPresent(key)
+
+    def _rollback_appended(self, key: Key, idx: int, inserted: bool = False) -> None:
+        """Undo one ``_raw_append``/``_insert_at`` of ``key`` at body ``idx``.
+
+        The mutation only just happened, so no other entry can reference the
+        added body position. Removing it shifts later indices down by one,
+        including the tuple fragments of every out-of-order table.
+        """
+        index = self._map.pop(key)
+        if isinstance(index, tuple):
+            remaining = tuple(i for i in index if i != idx)
+            if len(remaining) == 1:
+                self._map[key] = remaining[0]
+            elif remaining:
+                self._map[key] = remaining
+
+        if not isinstance(index, tuple) or len(index) == 1:
+            dict.__delitem__(self, key.key)
+            if not inserted and key in self._table_keys:
+                # _raw_append registered a table key; drop the last occurrence,
+                # which is the fragment being rolled back.
+                for position in range(len(self._table_keys) - 1, -1, -1):
+                    if self._table_keys[position] == key:
+                        del self._table_keys[position]
+                        break
+        self._out_of_order_keys.discard(key)
+        if key in self._map:
+            self._out_of_order_keys.add(key)
+
+        del self._body[idx]
+        for map_key, map_index in list(self._map.items()):
+            if isinstance(map_index, tuple):
+                self._map[map_key] = tuple(
+                    i - 1 if i > idx else i for i in map_index
+                )
+            elif map_index > idx:
+                self._map[map_key] = map_index - 1
+
+        self._validation_cache.pop(key, None)
+        if key in self:
+            dict.__setitem__(self, key.key, self.item(key).value)
+
     def as_string(self) -> str:
         """Render as TOML string."""
         s = ""
         for path, aot in _header_less_aots(self._body):
             s += _render_empty_aot(path, aot)
-        for k, v in self._body:
+        body = self._body
+        if not self._parsed:
+            # An emptied implicit table falls back to an explicit header
+            # (see _emits_header). If a later sibling renders inline, that
+            # header would capture it, so the emptied table is deferred past
+            # the inline entries. Only emptied tables can move: they carry no
+            # content, so reordering them changes nothing in the data model
+            # and preserves every declared table's position.
+            body = self._defer_emptied_tables(body)
+        for k, v in body:
             if k is not None:
                 if _is_empty_aot(v):
                     continue
@@ -691,7 +859,169 @@ class Container(_CustomDict):  # type: ignore[type-arg]
 
         return s
 
-    def _render_table(self, key: Key, table: Table, prefix: str | None = None) -> str:
+
+    def _render_aot(self, key: Key, aot: AoT, prefix: str | None = None) -> str:
+        _key = key.as_string()
+        if prefix is not None:
+            _key = prefix + "." + _key
+
+        cur = ""
+        _key = decode(_key)
+        for table in aot.body:
+            cur += self._render_aot_table(table, prefix=_key)
+
+        return cur
+
+
+    def _render_aot_table(self, table: Table, prefix: str | None = None) -> str:
+        cur = ""
+        _key = prefix or ""
+        open_, close = "[[", "]]"
+
+        cur += (
+            f"{table.trivia.indent}"
+            f"{open_}"
+            f"{decode(_key)}"
+            f"{close}"
+            f"{table.trivia.comment_ws}"
+            f"{decode(table.trivia.comment)}"
+            f"{table.trivia.trail}"
+        )
+
+        for path, aot in _header_less_aots(table.value.body):
+            cur += _render_empty_aot(path, aot)
+        for k, v in table.value.body:
+            if k is not None and _is_empty_aot(v):
+                continue
+            elif isinstance(v, Table):
+                assert k is not None
+                if v.is_super_table():
+                    if k.is_dotted():
+                        # A dotted child normally renders inline; only when it
+                        # needs its own ``[parent.a]`` header (e.g. it was
+                        # emptied) does the header take the enclosing path.
+                        if _emits_header(k, v):
+                            cur += self._render_table(k, v, prefix=_key)
+                        else:
+                            cur += self._render_table(k, v)
+                    else:
+                        cur += self._render_table(k, v, prefix=_key)
+                else:
+                    cur += self._render_table(k, v, prefix=_key)
+            elif isinstance(v, AoT):
+                assert k is not None
+                cur += self._render_aot(k, v, prefix=_key)
+            else:
+                cur += self._render_simple_item(k, v)
+
+        return cur
+
+
+    def _render_simple_item(
+        self, key: Key | None, item: Item, prefix: str | None = None
+    ) -> str:
+        if key is None:
+            return item.as_string()
+
+        _key = key.as_string()
+        if prefix is not None:
+            _key = prefix + "." + _key
+
+        return (
+            f"{item.trivia.indent}"
+            f"{decode(_key)}"
+            f"{key.sep}"
+            f"{decode(item.as_string())}"
+            f"{item.trivia.comment_ws}"
+            f"{decode(item.trivia.comment)}"
+            f"{item.trivia.trail}"
+        )
+
+
+    def _first_header_index(self) -> int | None:
+        """Index of the first body entry that opens a ``[header]`` scope."""
+        for i, (k, v) in enumerate(self._body):
+            if k is None or isinstance(v, (Null, Whitespace)):
+                continue
+            if isinstance(v, AoT):
+                return i
+            if isinstance(v, Table):
+                if isinstance(self._map.get(k), tuple):
+                    # An out-of-order table is a header-bearing entry.
+                    return i
+                if _emits_header(k, v) or self._renders_table_header(v):
+                    # A dotted super table renders inline itself, but any
+                    # descendant that emits a header opens a scope too.
+                    return i
+        return None
+
+    @staticmethod
+    def _renders_inline_entry(key: Key, item: Item) -> bool:
+        """Whether the entry renders inline (a value or a dotted super table)."""
+        if isinstance(item, AoT):
+            return False
+        if isinstance(item, Table):
+            return not _emits_header(key, item)
+        return True
+
+    @staticmethod
+    def _is_header_value(item: Item) -> bool:
+        """Whether the item renders its own ``[header]`` (not inline)."""
+        return isinstance(item, (Table, AoT)) and not isinstance(
+            item, InlineTable
+        )
+
+    def _defer_emptied_tables(
+        self, body: list[tuple[Key | None, Item]]
+    ) -> list[tuple[Key | None, Item]]:
+        """Move emptied implicit tables after any later inline entries."""
+        leading: list[tuple[Key | None, Item]] = []
+        deferred: list[tuple[Key | None, Item]] = []
+        for index, (key, item) in enumerate(body):
+            if self._is_emptied_implicit_table(key, item) and any(
+                self._is_inline_entry(lk, li)
+                for lk, li in body[index + 1 :]
+            ):
+                deferred.append((key, item))
+            else:
+                leading.append((key, item))
+        return leading + deferred
+
+    def _is_emptied_implicit_table(self, key: Key | None, item: Item) -> bool:
+        if key is None or not isinstance(item, Table) or isinstance(item, AoT):
+            return False
+        if isinstance(self._map.get(key), tuple):
+            return False
+        # An emptied implicit table only ever existed to carry its children:
+        # it was created by a dotted key or by a header path, so its key is
+        # dotted or the table is a super table. A table that was declared
+        # explicitly (its own ``[header]``) is not moved.
+        if not (key.is_dotted() or item.is_super_table()):
+            return False
+        return not any(
+            body_key is not None and not isinstance(body_item, Null)
+            for body_key, body_item in item.value.body
+        )
+
+    def _is_inline_entry(self, key: Key | None, item: Item) -> bool:
+        if key is None:
+            return not isinstance(item, (Whitespace, Null, Comment))
+        if isinstance(item, AoT):
+            return False
+        if isinstance(item, Table):
+            # Whether this entry (or anything below it) emits a header at all.
+            return not (
+                _emits_header(key, item) or self._renders_table_header(item)
+            )
+        return True
+
+    def _render_table(
+        self,
+        key: Key,
+        table: Table,
+        prefix: str | None = None,
+        fragment: bool = False,
+    ) -> str:
         cur = ""
 
         if table.display_name is not None:
@@ -702,7 +1032,7 @@ class Container(_CustomDict):  # type: ignore[type-arg]
             if prefix is not None:
                 _key = prefix + "." + _key
 
-        header_emitted = _emits_header(key, table)
+        header_emitted = _emits_header(key, table, fragment=fragment)
         if header_emitted:
             open_, close = "[", "]"
             if table.is_aot_element():
@@ -742,8 +1072,14 @@ class Container(_CustomDict):  # type: ignore[type-arg]
                 assert k is not None
                 if v.is_super_table():
                     if k.is_dotted() and not key.is_dotted():
-                        # Dotted key inside table
-                        cur += self._render_table(k, v)
+                        # A dotted child normally renders inline (``a.b = ...``)
+                        # without a prefix, unless it was emptied and now needs
+                        # its own ``[parent.a]`` header -- that header has to be
+                        # fully qualified from the enclosing table.
+                        if _emits_header(k, v):
+                            cur += self._render_table(k, v, prefix=_key)
+                        else:
+                            cur += self._render_table(k, v)
                     else:
                         cur += self._render_table(k, v, prefix=_key)
                 else:
@@ -800,8 +1136,13 @@ class Container(_CustomDict):  # type: ignore[type-arg]
                 assert k is not None
                 if v.is_super_table():
                     if k.is_dotted():
-                        # Dotted key inside table
-                        cur += self._render_table(k, v)
+                        # A dotted child normally renders inline; only when it
+                        # needs its own ``[parent.a]`` header (e.g. it was
+                        # emptied) does the header take the enclosing path.
+                        if _emits_header(k, v):
+                            cur += self._render_table(k, v, prefix=_key)
+                        else:
+                            cur += self._render_table(k, v)
                     else:
                         cur += self._render_table(k, v, prefix=_key)
                 else:
@@ -949,7 +1290,7 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         )
         if not isinstance(new_key, Key):
             if (
-                isinstance(value, (AoT, Table)) != isinstance(v, (AoT, Table))
+                self._is_header_value(value) != self._is_header_value(v)
                 or new_key != k.key
                 or dotted_to_header
             ):
@@ -963,11 +1304,11 @@ class Container(_CustomDict):  # type: ignore[type-arg]
             dict.__delitem__(self, k.key)
 
         if (
-            isinstance(value, (AoT, Table)) != isinstance(v, (AoT, Table))
+            self._is_header_value(value) != self._is_header_value(v)
             or reposition_dotted
         ):
             self.remove(k)
-            if isinstance(value, (AoT, Table)):
+            if self._is_header_value(value):
                 # New tables must appear after all entries that render inline:
                 # plain values and dotted keys (which are super tables). Skip
                 # those and insert before the first real ``[header]`` so the new
@@ -984,11 +1325,25 @@ class Container(_CustomDict):  # type: ignore[type-arg]
                     idx = -1
                     self.append(new_key, value)
             else:
-                # the replaced table's slot lies in the table region, where a
-                # plain value would be captured by the preceding table on
-                # round-trip; append() puts it with the other root-level values
+                # The replaced table's slot lies in the table region, where a
+                # plain value would be captured by any preceding (or
+                # following) ``[header]`` on round-trip, so it has to live in
+                # the container's header-free prefix. Use append(), which
+                # routes to a plain value's usual slot; it must come before
+                # every header entry, not merely before the first table.
                 idx = -1
-                self.append(new_key, value)
+                first_header = self._first_header_index()
+                if first_header is not None:
+                    header_item = self._body[first_header][1]
+                    if not (
+                        isinstance(header_item, Whitespace)
+                        or "\n" in header_item.trivia.indent
+                    ):
+                        header_item.trivia.indent = "\n" + header_item.trivia.indent
+                    self._insert_at(first_header, new_key, value)
+                    idx = first_header
+                else:
+                    self.append(new_key, value)
         else:
             # Copying trivia
             if not isinstance(value, (Whitespace, AoT)):
@@ -997,6 +1352,25 @@ class Container(_CustomDict):  # type: ignore[type-arg]
                 value.trivia.comment = value.trivia.comment or v.trivia.comment
                 value.trivia.trail = v.trivia.trail
             self._body[idx] = (new_key, value)
+            if not self._parsed and self._renders_inline_entry(new_key, value):
+                # An entry that renders inline stays in whatever header scope
+                # precedes it; if one does, move it into the container's
+                # header-free prefix so it keeps its own scope.
+                first_header = self._first_header_index()
+                if first_header is not None and first_header < idx:
+                    entry = self._body.pop(idx)
+                    self._body.insert(first_header, entry)
+                    for map_key, map_index in list(self._map.items()):
+                        if map_index == idx:
+                            self._map[map_key] = first_header
+                        elif isinstance(map_index, tuple):
+                            self._map[map_key] = tuple(
+                                i + 1 if first_header <= i < idx else i
+                                for i in map_index
+                            )
+                        elif first_header <= map_index < idx:
+                            self._map[map_key] = map_index + 1
+                    idx = first_header
 
         if value is not v and hasattr(value, "invalidate_display_name"):
             value.invalidate_display_name()
@@ -1066,11 +1440,18 @@ class Container(_CustomDict):  # type: ignore[type-arg]
 
     def __copy__(self) -> Self:
         c = self.__class__(self._parsed)
-        for k, v in dict.items(self):
-            dict.__setitem__(c, k, v)
+        # A copied document has to be independently editable: sharing the item
+        # objects would make trivia edits (comment/indent/trail) on one copy
+        # silently rewrite the other. Keys carry no trivia, so they can be
+        # shared; the items, index and table bookkeeping get their own copies.
+        for key, item in self._body:
+            copied_item = copy.copy(item)
+            c._body.append((key, copied_item))
+            if key is not None:
+                dict.__setitem__(c, key.key, copied_item.value)
 
-        c._body += self.body
         c._map.update(self._map)
+        c._table_keys.extend(self._table_keys)
         c._out_of_order_keys |= self._out_of_order_keys
 
         return c
@@ -1225,38 +1606,36 @@ class OutOfOrderTableProxy(_CustomDict):  # type: ignore[type-arg]
         if _key in self._tables_map:
             # Overwrite the first occurrence and remove this key from later parts.
             map_indices = self._tables_map[_key]
+            target = self._tables[map_indices[0]]
+            old_value = target[key]
+            if _is_table_or_aot(old_value) and not _is_table_or_aot(value):
+                # A table cannot be replaced by a value in the part that
+                # renders it as a header. Rehearse the rearrangement on a
+                # detached copy first, so a rejected edit leaves the original
+                # table in place instead of deleting it.
+                rehearsal = copy.deepcopy(self)
+                rehearsal._switch_table_to_value(_key, value)
+                self._switch_table_to_value(_key, value)
+                self._internal_container[_key] = value
+                if key is not None:
+                    dict.__setitem__(self, key, value)
+                return
             while len(map_indices) > 1:
                 table = self._tables[map_indices.pop()]
                 del table[key]
                 if not table:
                     self._remove_table(table)
-            old_value = self._tables[map_indices[0]][key]
-            if _is_table_or_aot(old_value) and not _is_table_or_aot(value):
-                # Remove the entry from the map and set value again.
-                del self._tables[map_indices[0]][key]
-                del self._tables_map[_key]
-                self[key] = value
-                return
             self._tables[map_indices[0]][key] = value
         elif self._tables:
-            table_index = 0
-            if not _is_table_or_aot(value):  # if the value is a plain value
-                for i, table in enumerate(self._tables):
-                    # find the first table that allows plain values
-                    if any(not _is_table_or_aot(v) for _, v in table.items()):
-                        table_index = i
-                        break
-                else:
-                    # No part holds a plain value yet, so the chosen part must
-                    # start rendering its own ``[key]`` header. Prefer a part
-                    # that is not a super table (it already renders that header):
-                    # turning a header-less super part concrete here would emit a
-                    # second, duplicate header next to an existing concrete part
-                    # and produce TOML that no longer parses.
-                    for i, table in enumerate(self._tables):
-                        if not table.is_super_table():
-                            table_index = i
-                            break
+            # A new entry needs a part whose rendering can carry it: plain
+            # values need an inline-capable part, and a new table needs one
+            # that renders a header of its own -- a headerless fragment would
+            # make the new ``[key]`` land in the enclosing scope instead.
+            table_index = self._choose_value_part(
+                require_header=_is_table_or_aot(value)
+            )
+            if table_index is None:
+                raise KeyAlreadyPresent(_key)
             self._tables[table_index][key] = value
             self._tables_map[_key] = [table_index]
         else:
@@ -1265,6 +1644,87 @@ class OutOfOrderTableProxy(_CustomDict):  # type: ignore[type-arg]
         self._internal_container[key] = value
         if key is not None:
             dict.__setitem__(self, key, value)
+
+    def _choose_value_part(
+        self, exclude: Key | None = None, require_header: bool = False
+    ) -> int | None:
+        """Pick the fragment that must host a new entry.
+
+        Plain values land in the first part that already carries them. If none
+        does, they must go into a part that renders its own ``[header]``; a
+        headerless fragment (e.g. one nested through a dotted key) cannot take
+        one, since forcing a header there duplicates the enclosing table's
+        path. A new *table* always requires a header-rendering part.
+
+        ``exclude`` is a key about to be removed from every part; a part that
+        would be left with nothing cannot host the entry either.
+        """
+
+        def usable(table: Table) -> bool:
+            if any(k is not None and k != exclude for k in table.value._map):
+                return True
+            fragment_key = self._key_of_table(table)
+            return fragment_key is not None and _emits_header(fragment_key, table)
+
+        def has_plain_value(table: Table) -> bool:
+            for k in table.value._map:
+                if k is None or k == exclude:
+                    continue
+                if not isinstance(table.value.item(k), (Table, AoT)):
+                    return True
+            return False
+
+        if not require_header:
+            for i, table in enumerate(self._tables):
+                if usable(table) and has_plain_value(table):
+                    return i
+        for i, table in enumerate(self._tables):
+            if not usable(table):
+                continue
+            fragment_key = self._key_of_table(table)
+            if fragment_key is not None and _emits_header(fragment_key, table):
+                return i
+        return None
+
+    def _key_of_table(self, table: Table) -> Key | None:
+        """The key under which ``table`` sits in the backing container."""
+        for body_key, body_item in self._container._body:
+            if body_key is not None and body_item is table:
+                return body_key
+        return None
+
+    def _switch_table_to_value(self, _key: Key, value: Any) -> None:
+        """Replace a table-valued key with a plain value across its parts."""
+        map_indices = self._tables_map[_key]
+        target = self._tables[map_indices[0]]
+        target_index = self._choose_value_part()
+        if target_index is None:
+            raise KeyAlreadyPresent(_key)
+        host = self._tables[target_index]
+        while len(map_indices) > 1:
+            table = self._tables[map_indices.pop()]
+            del table[_key]
+            if not table:
+                self._remove_table(table)
+        del target[_key]
+        if not target and host is not target:
+            # An emptied part that is not the host has nothing left to render.
+            # The host itself is kept even when it empties: it is about to
+            # receive the value.
+            self._remove_table(target)
+        host[_key] = value
+        self._rebuild_tables_map()
+
+    def _rebuild_tables_map(self) -> None:
+        """Recompute key -> part indices after fragments were added or dropped."""
+        self._tables_map.clear()
+        for i, table in enumerate(self._tables):
+            for k in table.value._map:
+                if k is None:
+                    continue
+                indices = self._tables_map.setdefault(k, [])
+                if i not in indices:
+                    indices.append(i)
 
     def _remove_table(self, table: Table) -> None:
         """Remove table from the parent container"""
