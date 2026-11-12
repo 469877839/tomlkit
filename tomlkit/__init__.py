@@ -10,6 +10,7 @@ from tomlkit.api import dump
 from tomlkit.api import dumps
 from tomlkit.api import float_
 from tomlkit.api import inline_table
+from tomlkit.api import iter_dumps
 from tomlkit.api import integer
 from tomlkit.api import item
 from tomlkit.api import key
@@ -41,6 +42,7 @@ __all__ = [
     "dumps",
     "float_",
     "inline_table",
+    "iter_dumps",
     "integer",
     "item",
     "key",

@@ -5,12 +5,15 @@ import datetime as _datetime
 import re
 
 from collections.abc import Iterable
+from collections.abc import Iterator
 from collections.abc import Mapping
 from typing import IO
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import TypeVar
 
+from tomlkit._stream import StringWriter
+from tomlkit._stream import Writer
 from tomlkit._utils import parse_rfc3339
 from tomlkit._utils import validate_comment
 from tomlkit.container import Container
@@ -55,28 +58,181 @@ def loads(string: str | bytes) -> TOMLDocument:
     return parse(string)
 
 
+def _as_renderable(
+    data: Mapping[str, Any], sort_keys: bool = False
+) -> _Item | Container | _PlainString:
+    """Return the item/container that renders ``data``.
+
+    Raises ``TypeError`` for inputs that cannot be rendered as a TOML table.
+    """
+    if isinstance(data, (Table, InlineTable, Container)):
+        if not sort_keys:
+            return data
+
+        return item(data, _sort_keys=True)
+
+    if isinstance(data, Mapping):
+        return item(dict(data), _sort_keys=sort_keys)
+
+    # Mapping-like wrappers (e.g. dotty_dict's Dotty) delegate ``as_string``
+    # to the document they wrap; rendering it directly preserves the original
+    # layout, which re-encoding through a plain dict would lose.
+    render = getattr(data, "_render", None)
+    if render is not None:
+        return data  # type: ignore[return-value]
+
+    as_string = getattr(data, "as_string", None)
+    if as_string is None:
+        msg = f"Expecting Mapping or TOML Table or Container, {type(data)} given"
+        raise TypeError(msg)
+
+    # A wrapper without the streaming ``_render`` hook can only be rendered
+    # through the string it already knows how to produce.
+    return _PlainString(as_string)
+
+
+class _PlainString:
+    """Adapter for a wrapper that only offers ``as_string``.
+
+    The wrapper's own ``as_string`` is called on every render -- never cached
+    -- so repeated dumps see edits made in between, as they did before.
+    """
+
+    def __init__(self, as_string: Any) -> None:
+        self._as_string = as_string
+
+    def _render(self, write: Writer) -> None:
+        write(self._as_string())
+
+
 def dumps(data: Mapping[str, Any], sort_keys: bool = False) -> str:
     """
     Dumps a TOMLDocument into a string.
     """
-    if isinstance(data, (Table, InlineTable, Container)):
-        if not sort_keys:
-            return data.as_string()
+    renderable = _as_renderable(data, sort_keys)
+    writer = StringWriter()
+    renderable._render(writer.write)
+    return writer.getvalue()
 
-        return item(data, _sort_keys=True).as_string()
 
-    if isinstance(data, Mapping):
-        return item(dict(data), _sort_keys=sort_keys).as_string()
+_DONE = object()
 
+
+def _iter_fragments(
+    renderable: _Item | Container | _PlainString,
+) -> Iterator[str]:
+    """Yield each render fragment as soon as it is produced.
+
+    The renderer takes a plain ``write(fragment)`` callback, which cannot by
+    itself suspend its call stack. A daemon thread therefore drives the render
+    walk and hands each fragment over through a one-slot bounded queue: the
+    walk blocks as soon as a fragment is waiting, so it cannot run ahead of the
+    consumer and at most one fragment (plus the current scalar and the scope
+    stack held by the renderer) is resident at a time.
+
+    If the consumer stops early -- by closing the iterator, breaking out of a
+    loop, or raising out of it -- the queue is released and the render thread
+    is told to stop. Rendering never mutates the document, so it can be
+    restarted afterwards. Exceptions raised while rendering are re-raised in
+    the consumer.
+    """
+    import queue
+    import threading
+
+    slots: queue.Queue[object] = queue.Queue(maxsize=1)
+    stopped = threading.Event()
+    finished = threading.Event()
+
+    def put(item: object) -> bool:
+        """Hand ``item`` over unless the consumer has gone away."""
+        while not stopped.is_set():
+            try:
+                slots.put(item, timeout=0.05)
+            except queue.Full:
+                continue
+            return True
+        return False
+
+    def worker() -> None:
+        try:
+            def write(fragment: str) -> None:
+                if not put(fragment):
+                    # The consumer abandoned the iteration; unwind the render.
+                    raise _AbandonedRender
+
+            renderable._render(write)
+        except _AbandonedRender:
+            pass
+        except BaseException as exc:  # deliver the failure to the consumer
+            put(exc)
+        finally:
+            put(_DONE)
+            finished.set()
+
+    thread = threading.Thread(target=worker, name="tomlkit-iter-dumps", daemon=True)
+    thread.start()
     try:
-        # mapping-like wrappers (e.g. dotty_dict's Dotty) delegate
-        # ``as_string`` to the document they wrap; rendering it directly
-        # preserves the original layout, which re-encoding through a plain
-        # dict would lose
-        return data.as_string()  # type: ignore[attr-defined]
-    except AttributeError as ex:
-        msg = f"Expecting Mapping or TOML Table or Container, {type(data)} given"
-        raise TypeError(msg) from ex
+        while True:
+            item = slots.get()
+            if item is _DONE:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            fragment = item
+            assert isinstance(fragment, str)
+            yield fragment
+    finally:
+        stopped.set()
+        # Unblock a worker waiting on a full queue.
+        try:
+            while True:
+                slots.get_nowait()
+        except queue.Empty:
+            pass
+        finished.wait(timeout=1.0)
+
+
+class _AbandonedRender(Exception):
+    """Internal signal: the consumer stopped iterating."""
+
+
+def iter_dumps(
+    data: Mapping[str, Any],
+    sort_keys: bool = False,
+    chunk_size: int | None = None,
+) -> Iterator[str]:
+    """
+    Iteratively dumps a TOMLDocument into small string chunks.
+
+    Unlike :func:`dumps`, the full rendered document is never assembled in
+    memory: rendering only resumes when the caller asks for the next chunk,
+    so fragments are produced on demand while the document tree is walked.
+    Joining the chunks yields exactly the string :func:`dumps` would return
+    for the same input.
+
+    :param data: a dict-like object to dump
+    :param sort_keys: if true, sort the keys in alphabetic order
+    :param chunk_size: if given, coalesce fragments into chunks of at most
+        this many characters; otherwise every render fragment is yielded as
+        soon as it is produced
+    """
+    if chunk_size is not None and chunk_size <= 0:
+        msg = "chunk_size must be a positive integer or None"
+        raise ValueError(msg)
+
+    renderable = _as_renderable(data, sort_keys)
+    if chunk_size is None:
+        yield from _iter_fragments(renderable)
+        return
+
+    pending = ""
+    for fragment in _iter_fragments(renderable):
+        pending += fragment
+        while len(pending) >= chunk_size:
+            yield pending[:chunk_size]
+            pending = pending[chunk_size:]
+    if pending:
+        yield pending
 
 
 def load(fp: IO[str] | IO[bytes]) -> TOMLDocument:
@@ -90,6 +246,10 @@ def dump(data: Mapping[str, Any], fp: IO[str], *, sort_keys: bool = False) -> No
     """
     Dump a TOMLDocument into a writable file stream.
 
+    The document is streamed fragment by fragment straight to ``fp`` instead
+    of being assembled into one string first, so writing a large document does
+    not need memory proportional to its rendered size.
+
     :param data: a dict-like object to dump
     :param sort_keys: if true, sort the keys in alphabetic order
 
@@ -98,7 +258,8 @@ def dump(data: Mapping[str, Any], fp: IO[str], *, sort_keys: bool = False) -> No
     >>> with open("output.toml", "w") as fp:
     ...     tomlkit.dump(data, fp)
     """
-    fp.write(dumps(data, sort_keys=sort_keys))
+    renderable = _as_renderable(data, sort_keys)
+    renderable._render(fp.write)
 
 
 def parse(string: str | bytes) -> TOMLDocument:

@@ -25,6 +25,8 @@ from typing import overload
 
 from tomlkit._compat import PY38
 from tomlkit._compat import decode
+from tomlkit._stream import StringWriter
+from tomlkit._stream import Writer
 from tomlkit._types import _CustomDict
 from tomlkit._types import _CustomFloat
 from tomlkit._types import _CustomInt
@@ -567,6 +569,15 @@ class Item:
     def as_string(self) -> str:
         """The TOML representation"""
         raise NotImplementedError()
+
+    def _render(self, write: Writer) -> None:
+        """Stream the TOML representation to ``write``.
+
+        Renderers emit small fragments as they go instead of assembling the
+        whole representation, so the memory used is independent of the output
+        length. ``as_string`` is the buffered convenience form of this method.
+        """
+        write(self.as_string())
 
     @property
     def value(self) -> Any:
@@ -1475,6 +1486,37 @@ class _ArrayItemGroup:
         return True
 
 
+class _PendingTail:
+    """Fragments written after an inline table's last value.
+
+    A separator comma has to be inserted right after that value rather than
+    after the trailing comment/whitespace, so the fragments are held back here
+    until the next key (which flushes them after a comma) or the closing brace
+    (which flushes them as-is) is reached. The held fragments are small trivia
+    pieces, so this never grows with the document size.
+    """
+
+    __slots__ = ("_parts",)
+
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+
+    def write(self, fragment: str) -> None:
+        self._parts.append(fragment)
+
+    def flush(self, write: Writer) -> None:
+        for fragment in self._parts:
+            write(fragment)
+        self._parts.clear()
+
+    def startswith(self, prefix: str) -> bool:
+        return "".join(self._parts).startswith(prefix)
+
+    def rstrip(self, chars: str) -> None:
+        joined = "".join(self._parts).rstrip(chars)
+        self._parts = [joined] if joined else []
+
+
 class Array(Item, _CustomList):  # type: ignore[type-arg]
     """
     An array literal
@@ -1564,30 +1606,40 @@ class Array(Item, _CustomList):  # type: ignore[type-arg]
         return self
 
     def as_string(self) -> str:
+        writer = StringWriter()
+        self._render(writer.write)
+        return writer.getvalue()
+
+    def _render(self, write: Writer) -> None:
         if not self._multiline or not self._value:
-            rendered = list(self._iter_items())
-            inner = "".join(v.as_string() for v in rendered)
-            if rendered and isinstance(rendered[-1], Comment):
+            write("[")
+            last: Item | None = None
+            for v in self._iter_items():
+                v._render(write)
+                last = v
+            if isinstance(last, Comment):
                 # A trailing comment (e.g. from add_line(comment=...)) carries
                 # no newline, so keep the closing bracket off the comment line
                 # to produce parseable output (GH #580).
-                inner += "\n" + self.trivia.indent
-            return f"[{inner}]"
+                write("\n")
+                write(self.trivia.indent)
+            write("]")
+            return
 
-        s = "[\n"
-        s += "".join(
-            self.trivia.indent
-            + " " * 4
-            + v.value.as_string()
-            + ("," if not isinstance(v.value, Null) else "")
-            + (v.comment.as_string() if v.comment is not None else "")
-            + "\n"
-            for v in self._value
-            if v.value is not None
-        )
-        s += self.trivia.indent + "]"
-
-        return s
+        write("[\n")
+        for group in self._value:
+            if group.value is None:
+                continue
+            write(self.trivia.indent)
+            write(" " * 4)
+            group.value._render(write)
+            if not isinstance(group.value, Null):
+                write(",")
+            if group.comment is not None:
+                group.comment._render(write)
+            write("\n")
+        write(self.trivia.indent)
+        write("]")
 
     def _reindex(self) -> None:
         self._index_map.clear()
@@ -2083,6 +2135,9 @@ class Table(AbstractTable):
     def as_string(self) -> str:
         return self._value.as_string()
 
+    def _render(self, write: Writer) -> None:
+        self._value._render(write)
+
     # Helpers
 
     def indent(self, indent: int) -> Table:
@@ -2168,7 +2223,12 @@ class InlineTable(AbstractTable):
             raise ValueError("Inline tables cannot contain a table")
 
     def as_string(self) -> str:
-        buf = "{"
+        writer = StringWriter()
+        self._render(writer.write)
+        return writer.getvalue()
+
+    def _render(self, write: Writer) -> None:
+        write("{")
         emitted_key = False
         needs_separator = False
         # Single pass over the body to precompute everything the render loop
@@ -2187,15 +2247,18 @@ class InlineTable(AbstractTable):
             if isinstance(_v, Null):
                 last_null_idx = _i
         pending_separator = False
-        # Buffer position right after the last rendered value, used to place a
-        # deferred separator comma after the value rather than after a trailing
-        # comment/whitespace.
-        last_value_end = len(buf)
+        # Everything written after the last value (trailing comment/whitespace
+        # or a removed element's leftover comma) is held back here so a
+        # deferred separator comma can be inserted right after the value
+        # rather than after that trivia. The held fragments are small pieces
+        # of trivia, so this never grows with the inline table's size.
+        tail = _PendingTail()
+        last_index = len(self._value.body) - 1
         for i, (k, v) in enumerate(self._value.body):
             if k is None:
                 if isinstance(v, Whitespace) and "," in v.s:
                     if not emitted_key:
-                        buf += v.as_string().replace(",", "", 1)
+                        tail.write(v.as_string().replace(",", "", 1))
                         continue
 
                     # Equivalent to scanning body[i + 1 :] for a Null / a real
@@ -2203,26 +2266,26 @@ class InlineTable(AbstractTable):
                     has_following_null = last_null_idx > i
                     has_following_key = last_item_idx is not None and last_item_idx > i
                     if has_following_null and not has_following_key:
-                        buf += v.as_string().replace(",", "", 1)
+                        tail.write(v.as_string().replace(",", "", 1))
                         continue
 
                     if pending_separator:
                         # A previous key was removed, leaving this comma as a
                         # duplicate of an already emitted separator. Drop it to
                         # avoid producing an invalid ``, ,`` sequence.
-                        buf += v.as_string().replace(",", "", 1)
+                        tail.write(v.as_string().replace(",", "", 1))
                         continue
 
                     pending_separator = True
 
-                if i == len(self._value.body) - 1:
+                if i == last_index:
                     if self._new:
-                        buf = buf.rstrip(", ")
+                        tail.rstrip(", ")
                     elif not has_explicit_commas or "," in v.as_string():
-                        buf = buf.rstrip(",")
+                        tail.rstrip(",")
 
                 v_string = v.as_string()
-                buf += v_string
+                tail.write(v_string)
                 if "," in v_string:
                     needs_separator = False
 
@@ -2238,26 +2301,29 @@ class InlineTable(AbstractTable):
                 # trivia plus the new key's own indent) does not already start
                 # with one, so a padded table like ``{ a = 1 }`` -- which
                 # contributes the space itself -- does not end up double-spaced.
-                following = buf[last_value_end:] + v.trivia.indent
-                separator = "," if following.startswith(" ") else ", "
-                buf = f"{buf[:last_value_end]}{separator}{buf[last_value_end:]}"
+                following = tail.startswith(" ") or v.trivia.indent.startswith(" ")
+                write("," if following else ", ")
                 needs_separator = False
 
+            # Everything held back after the previous value (an explicit comma,
+            # a comment or plain whitespace) is written before the new key.
+            tail.flush(write)
+
             v_trivia_trail = v.trivia.trail.replace("\n", "")
+            write(v.trivia.indent)
             if k.is_dotted() and isinstance(v, Table):
                 # A table materialized from a dotted key renders one
                 # `prefix.child = value` pair per child, so that keys added
                 # after parsing stay attached to the dotted prefix.
-                rendered = ", ".join(self._render_dotted(k, v))
+                self._render_dotted(k, v, write)
             else:
-                rendered = (
-                    f"{k.as_string() + ('.' if k.is_dotted() else '')}"
-                    f"{k.sep}"
-                    f"{v.as_string()}"
-                )
-            buf += f"{v.trivia.indent}{rendered}"
-            last_value_end = len(buf)
-            buf += f"{v.trivia.comment}{v_trivia_trail}"
+                write(k.as_string())
+                if k.is_dotted():
+                    write(".")
+                write(k.sep)
+                v._render(write)
+            write(v.trivia.comment)
+            write(v_trivia_trail)
             emitted_key = True
             pending_separator = False
             if has_explicit_commas:
@@ -2268,35 +2334,76 @@ class InlineTable(AbstractTable):
                 and last_item_idx is not None
                 and i < last_item_idx
             ):
-                buf += ","
+                write(",")
                 if self._new:
-                    buf += " "
+                    write(" ")
 
-        buf += "}"
+        tail.flush(write)
+        write("}")
 
-        return buf
+    def _render_dotted(self, key: Key, table: Table, write: Writer) -> None:
+        """Render a table materialized from a dotted key as one
+        ``prefix.child = value`` pair per child, separated by ``, `` and
+        recursing into nested dotted children.
 
-    def _render_dotted(self, key: Key, table: Table) -> list[str]:
-        """Render a table materialized from a dotted key as a list of
-        ``prefix.child = value`` strings, recursing into nested dotted
-        children."""
+        Only the dotted prefixes, one scalar at a time and the shared
+        "first pair" flag are held in memory; nothing is accumulated across
+        the inline table.
+        """
+        state = {"first": True}
         prefix = f"{key.as_string()}.{key.sep}"
-        parts = []
+        self._render_dotted_pairs(table, prefix, write, state, path=key.as_string())
+
+    def _render_dotted_pairs(
+        self,
+        table: Table,
+        prefix: str,
+        write: Writer,
+        state: dict[str, bool],
+        path: str,
+    ) -> bool:
+        # The original implementation flattened every pair -- including the
+        # pairs contributed by nested tables -- and joined them with ", ", so
+        # the "first pair" state is shared across the whole recursion. Only
+        # leaf pairs emit a separator; a nested table contributes its leaves.
+        emitted = False
         for k, v in table.value.body:
             if k is None:
                 continue
             if isinstance(v, Table):
-                parts.extend(f"{prefix}{sub}" for sub in self._render_dotted(k, v))
-            else:
-                trail = v.trivia.trail.replace("\n", "")
-                parts.append(
-                    f"{prefix}{v.trivia.indent}{k.as_string()}{k.sep}{v.as_string()}"
-                    f"{v.trivia.comment_ws}{v.trivia.comment}{trail}"
+                emitted = (
+                    self._render_dotted_pairs(
+                        v,
+                        f"{prefix}{k.as_string()}.{k.sep}",
+                        write,
+                        state,
+                        path=f"{path}.{k.as_string()}",
+                    )
+                    or emitted
                 )
-        if not parts:
+            else:
+                if not state["first"]:
+                    write(", ")
+                state["first"] = False
+                emitted = True
+                trail = v.trivia.trail.replace("\n", "")
+                write(prefix)
+                write(v.trivia.indent)
+                write(k.as_string())
+                write(k.sep)
+                v._render(write)
+                write(v.trivia.comment_ws)
+                write(v.trivia.comment)
+                write(trail)
+        if not emitted:
             # every key under the prefix was removed, keep it as an empty table
-            return [f"{key.as_string()} = {{}}"]
-        return parts
+            if not state["first"]:
+                write(", ")
+            state["first"] = False
+            write(path)
+            write(" = {}")
+            emitted = True
+        return emitted
 
     def __setitem__(self, key: Key | str, value: Any) -> None:
         if hasattr(value, "trivia") and value.trivia.comment:
@@ -2491,11 +2598,13 @@ class AoT(Item, _CustomList):  # type: ignore[type-arg]
                 child.invalidate_display_name()
 
     def as_string(self) -> str:
-        b = ""
-        for table in self._body:
-            b += table.as_string()
+        writer = StringWriter()
+        self._render(writer.write)
+        return writer.getvalue()
 
-        return b
+    def _render(self, write: Writer) -> None:
+        for table in self._body:
+            table._render(write)
 
     def __repr__(self) -> str:
         return f"<AoT {self.value}>"

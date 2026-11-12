@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add `iter_dumps()`, which yields the rendered document as small chunks on demand instead of building the whole string at once; joining the chunks is character-identical to `dumps()`. `dump()` now also streams straight to the file object. The renderers only keep the current scalar and the table scope stack in memory, so memory no longer grows with the output size, and aborting the consumer or a failing writer leaves the document renderable again.
+
 ### Changed
 
 - Speed up repeated array appends by keeping existing indexes instead of rebuilding them.

@@ -67,6 +67,24 @@ TOML Kit provides an intuitive API to modify TOML documents::
     >>> doc.pop("table2")
     # del doc["table2] is also possible
 
+Streaming
+~~~~~~~~~
+
+For a document with many arrays or tables, :func:`dumps` builds the whole
+output as one string. :func:`iter_dumps` instead yields it in small chunks,
+so it can be written out piece by piece without holding the full output in
+memory. Joining the chunks gives exactly what :func:`dumps` returns::
+
+    >>> from tomlkit import iter_dumps
+
+    >>> with open("output.toml", "w", encoding="utf-8") as fp:
+    ...     for chunk in iter_dumps(doc):
+    ...         fp.write(chunk)
+
+:func:`dump` uses the same streaming path internally. If the consumer stops
+iterating early or a write fails, the document is left unmodified and can
+simply be rendered again.
+
 Boolean comments
 ~~~~~~~~~~~~~~~~
 

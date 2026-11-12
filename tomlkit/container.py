@@ -12,6 +12,8 @@ if TYPE_CHECKING:
     from typing import Self
 
 from tomlkit._compat import decode
+from tomlkit._stream import StringWriter
+from tomlkit._stream import Writer
 from tomlkit._types import _CustomDict
 from tomlkit._utils import merge_dicts
 from tomlkit.exceptions import InvalidStringError
@@ -65,7 +67,7 @@ def _emits_header(key: Key, table: Table) -> bool:
 
 def _header_less_aots(
     body: list[tuple[Key | None, Item]], prefix: str = ""
-) -> list[tuple[str, AoT]]:
+) -> Iterator[tuple[str, AoT]]:
     """Every emptied array of tables reachable without crossing a header.
 
     An emptied array of tables has no ``[[key]]`` header left to render, so it
@@ -75,31 +77,55 @@ def _header_less_aots(
     with a key relative to it, and that includes the ones sitting inside super
     tables, which emit no header to separate them.
 
-    Returns ``(dotted key, aot)`` pairs, keyed relative to the scope ``body``
+    Yields ``(dotted key, aot)`` pairs, keyed relative to the scope ``body``
     belongs to.
     """
-    found: list[tuple[str, AoT]] = []
     for k, v in body:
         if k is None:
             continue
         path = f"{prefix}.{k.as_string()}" if prefix else k.as_string()
         if _is_empty_aot(v):
-            found.append((path, v))
+            yield path, v
         elif isinstance(v, Table) and not _emits_header(k, v):
-            found.extend(_header_less_aots(v.value.body, path))
-    return found
+            yield from _header_less_aots(v.value.body, path)
 
 
-def _render_empty_aot(key: str, aot: AoT) -> str:
+def _render_empty_aot(key: str, aot: AoT, write: Writer) -> None:
     """Render an emptied array of tables as an inline empty array."""
-    return (
-        f"{aot.trivia.indent}"
-        f"{decode(key)}"
-        f" = []"
-        f"{aot.trivia.comment_ws}"
-        f"{decode(aot.trivia.comment)}"
-        f"{aot.trivia.trail or chr(10)}"
-    )
+    write(aot.trivia.indent)
+    write(decode(key))
+    write(" = []")
+    write(aot.trivia.comment_ws)
+    write(decode(aot.trivia.comment))
+    write(aot.trivia.trail or chr(10))
+
+
+class _RenderState:
+    """Streaming render sink tracking whether the output ends with a newline.
+
+    The table/AoT renderers insert a separating newline when the preceding
+    fragment did not end with one. Only the fragment texts and this flag are
+    kept; the assembled output is never stored.
+    """
+
+    __slots__ = ("_last_fragment", "_write")
+
+    def __init__(self, write: Writer) -> None:
+        self._write = write
+        self._last_fragment = ""
+
+    def write(self, fragment: str) -> None:
+        if fragment:
+            self._write(fragment)
+            self._last_fragment = fragment
+
+    def separate(self, indent: str) -> None:
+        """Write the separating newline needed before a table or AoT header."""
+        last = self._last_fragment
+        stripped = last.strip(" ")
+        if stripped and not stripped.endswith("\n") and "\n" not in indent:
+            self._write("\n")
+            self._last_fragment = "\n"
 
 
 class Container(_CustomDict):  # type: ignore[type-arg]
@@ -661,39 +687,33 @@ class Container(_CustomDict):  # type: ignore[type-arg]
 
     def as_string(self) -> str:
         """Render as TOML string."""
-        s = ""
+        writer = StringWriter()
+        self._render(writer.write)
+        return writer.getvalue()
+
+    def _render(self, write: Writer) -> None:
+        """Render as TOML, streaming each fragment through ``write``."""
+        out = _RenderState(write)
         for path, aot in _header_less_aots(self._body):
-            s += _render_empty_aot(path, aot)
+            _render_empty_aot(path, aot, out.write)
         for k, v in self._body:
             if k is not None:
                 if _is_empty_aot(v):
                     continue
                 if isinstance(v, Table):
-                    if (
-                        s.strip(" ")
-                        and not s.strip(" ").endswith("\n")
-                        and "\n" not in v.trivia.indent
-                    ):
-                        s += "\n"
-                    s += self._render_table(k, v)
+                    out.separate(v.trivia.indent)
+                    self._render_table(k, v, out=out)
                 elif isinstance(v, AoT):
-                    if (
-                        s.strip(" ")
-                        and not s.strip(" ").endswith("\n")
-                        and "\n" not in v.trivia.indent
-                    ):
-                        s += "\n"
-                    s += self._render_aot(k, v)
+                    out.separate(v.trivia.indent)
+                    self._render_aot(k, v, out=out)
                 else:
-                    s += self._render_simple_item(k, v)
+                    self._render_simple_item(k, v, out=out)
             else:
-                s += self._render_simple_item(k, v)
+                self._render_simple_item(k, v, out=out)
 
-        return s
-
-    def _render_table(self, key: Key, table: Table, prefix: str | None = None) -> str:
-        cur = ""
-
+    def _render_table(
+        self, key: Key, table: Table, out: _RenderState, prefix: str | None = None
+    ) -> None:
         if table.display_name is not None:
             _key = table.display_name
         else:
@@ -711,88 +731,72 @@ class Container(_CustomDict):  # type: ignore[type-arg]
             newline_in_table_trivia = (
                 "\n" if "\n" not in table.trivia.trail and len(table.value) > 0 else ""
             )
-            cur += (
-                f"{table.trivia.indent}"
-                f"{open_}"
-                f"{decode(_key)}"
-                f"{close}"
-                f"{table.trivia.comment_ws}"
-                f"{decode(table.trivia.comment)}"
-                f"{table.trivia.trail}"
-                f"{newline_in_table_trivia}"
-            )
+            out.write(table.trivia.indent)
+            out.write(open_)
+            out.write(decode(_key))
+            out.write(close)
+            out.write(table.trivia.comment_ws)
+            out.write(decode(table.trivia.comment))
+            out.write(table.trivia.trail)
+            out.write(newline_in_table_trivia)
         elif table.trivia.indent == "\n":
-            cur += table.trivia.indent
+            out.write(table.trivia.indent)
 
         if header_emitted:
             # A super table opens no scope, so its fallbacks belong to -- and
             # were already written by -- the nearest enclosing header instead.
             for path, aot in _header_less_aots(table.value.body):
-                cur += _render_empty_aot(path, aot)
+                _render_empty_aot(path, aot, out.write)
         for k, v in table.value.body:
             if k is not None and _is_empty_aot(v):
                 continue
             elif isinstance(v, Table):
-                if (
-                    cur.strip(" ")
-                    and not cur.strip(" ").endswith("\n")
-                    and "\n" not in v.trivia.indent
-                ):
-                    cur += "\n"
+                out.separate(v.trivia.indent)
                 assert k is not None
                 if v.is_super_table():
                     if k.is_dotted() and not key.is_dotted():
                         # Dotted key inside table
-                        cur += self._render_table(k, v)
+                        self._render_table(k, v, out=out)
                     else:
-                        cur += self._render_table(k, v, prefix=_key)
+                        self._render_table(k, v, out=out, prefix=_key)
                 else:
-                    cur += self._render_table(k, v, prefix=_key)
+                    self._render_table(k, v, out=out, prefix=_key)
             elif isinstance(v, AoT):
-                if (
-                    cur.strip(" ")
-                    and not cur.strip(" ").endswith("\n")
-                    and "\n" not in v.trivia.indent
-                ):
-                    cur += "\n"
+                out.separate(v.trivia.indent)
                 assert k is not None
-                cur += self._render_aot(k, v, prefix=_key)
+                self._render_aot(k, v, out=out, prefix=_key)
             else:
-                cur += self._render_simple_item(
-                    k, v, prefix=_key if key.is_dotted() else None
+                self._render_simple_item(
+                    k, v, out=out, prefix=_key if key.is_dotted() else None
                 )
 
-        return cur
-
-    def _render_aot(self, key: Key, aot: AoT, prefix: str | None = None) -> str:
+    def _render_aot(
+        self, key: Key, aot: AoT, out: _RenderState, prefix: str | None = None
+    ) -> None:
         _key = key.as_string()
         if prefix is not None:
             _key = prefix + "." + _key
 
-        cur = ""
         _key = decode(_key)
         for table in aot.body:
-            cur += self._render_aot_table(table, prefix=_key)
+            self._render_aot_table(table, out=out, prefix=_key)
 
-        return cur
-
-    def _render_aot_table(self, table: Table, prefix: str | None = None) -> str:
-        cur = ""
+    def _render_aot_table(
+        self, table: Table, out: _RenderState, prefix: str | None = None
+    ) -> None:
         _key = prefix or ""
         open_, close = "[[", "]]"
 
-        cur += (
-            f"{table.trivia.indent}"
-            f"{open_}"
-            f"{decode(_key)}"
-            f"{close}"
-            f"{table.trivia.comment_ws}"
-            f"{decode(table.trivia.comment)}"
-            f"{table.trivia.trail}"
-        )
+        out.write(table.trivia.indent)
+        out.write(open_)
+        out.write(decode(_key))
+        out.write(close)
+        out.write(table.trivia.comment_ws)
+        out.write(decode(table.trivia.comment))
+        out.write(table.trivia.trail)
 
         for path, aot in _header_less_aots(table.value.body):
-            cur += _render_empty_aot(path, aot)
+            _render_empty_aot(path, aot, out.write)
         for k, v in table.value.body:
             if k is not None and _is_empty_aot(v):
                 continue
@@ -801,38 +805,39 @@ class Container(_CustomDict):  # type: ignore[type-arg]
                 if v.is_super_table():
                     if k.is_dotted():
                         # Dotted key inside table
-                        cur += self._render_table(k, v)
+                        self._render_table(k, v, out=out)
                     else:
-                        cur += self._render_table(k, v, prefix=_key)
+                        self._render_table(k, v, out=out, prefix=_key)
                 else:
-                    cur += self._render_table(k, v, prefix=_key)
+                    self._render_table(k, v, out=out, prefix=_key)
             elif isinstance(v, AoT):
                 assert k is not None
-                cur += self._render_aot(k, v, prefix=_key)
+                self._render_aot(k, v, out=out, prefix=_key)
             else:
-                cur += self._render_simple_item(k, v)
-
-        return cur
+                self._render_simple_item(k, v, out=out)
 
     def _render_simple_item(
-        self, key: Key | None, item: Item, prefix: str | None = None
-    ) -> str:
+        self,
+        key: Key | None,
+        item: Item,
+        out: _RenderState,
+        prefix: str | None = None,
+    ) -> None:
         if key is None:
-            return item.as_string()
+            item._render(out.write)
+            return
 
         _key = key.as_string()
         if prefix is not None:
             _key = prefix + "." + _key
 
-        return (
-            f"{item.trivia.indent}"
-            f"{decode(_key)}"
-            f"{key.sep}"
-            f"{decode(item.as_string())}"
-            f"{item.trivia.comment_ws}"
-            f"{decode(item.trivia.comment)}"
-            f"{item.trivia.trail}"
-        )
+        out.write(item.trivia.indent)
+        out.write(decode(_key))
+        out.write(key.sep)
+        item._render(out.write)
+        out.write(item.trivia.comment_ws)
+        out.write(decode(item.trivia.comment))
+        out.write(item.trivia.trail)
 
     def __len__(self) -> int:
         return dict.__len__(self)
