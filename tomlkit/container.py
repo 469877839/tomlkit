@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import math
 
+from collections.abc import Iterable
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
 from typing import Any
@@ -17,6 +18,7 @@ from tomlkit._utils import merge_dicts
 from tomlkit.exceptions import InvalidStringError
 from tomlkit.exceptions import KeyAlreadyPresent
 from tomlkit.exceptions import NonExistentKey
+from tomlkit.exceptions import TableMoveError
 from tomlkit.exceptions import TOMLKitError
 from tomlkit.items import AoT
 from tomlkit.items import Comment
@@ -100,6 +102,260 @@ def _render_empty_aot(key: str, aot: AoT) -> str:
         f"{decode(aot.trivia.comment)}"
         f"{aot.trivia.trail or chr(10)}"
     )
+
+
+def _path_segments(path: str | Iterable[str]) -> list[SingleKey]:
+    """Normalize a table path into its single-key segments.
+
+    A string is parsed as a TOML key, so dotted segments (``"a.b"``) and
+    quoted segments (``'"a.b"'``) work exactly like they do in a table
+    header; an iterable of strings is taken segment by segment.
+    """
+    if isinstance(path, str):
+        from tomlkit.parser import Parser
+
+        parser = Parser(path)
+        try:
+            key = parser._parse_key()
+        except TOMLKitError as e:
+            raise TableMoveError(f"Invalid table path {path!r}: {e}") from e
+        if not parser.end():
+            raise TableMoveError(f"Invalid table path: {path!r}")
+        segments = list(key)
+    else:
+        try:
+            segments = [
+                seg if isinstance(seg, SingleKey) else SingleKey(seg) for seg in path
+            ]
+        except TypeError as e:
+            raise TableMoveError(f"Invalid table path: {path!r}") from e
+
+    if not segments:
+        raise TableMoveError("A table path needs at least one segment")
+    if any(seg.key == "" for seg in segments):
+        raise TableMoveError("A table path cannot contain an empty segment")
+    return segments
+
+
+class _TableRef:
+    """The location of a table inside the document tree."""
+
+    def __init__(
+        self,
+        container: Container,
+        key: SingleKey,
+        table: Table,
+        index: int,
+        segments: list[SingleKey],
+    ) -> None:
+        self.container = container
+        self.key = key
+        self.table = table
+        self.index = index
+        self.segments = segments
+
+    @property
+    def path(self) -> str:
+        return ".".join(s.key for s in self.segments)
+
+
+def _resolve_table(container: Container, segments: list[SingleKey]) -> _TableRef:
+    """Walk ``segments`` from ``container`` to the table they name.
+
+    Every segment must resolve to a table (an AoT is not addressable here);
+    the last one must be a plain ``Table`` that is not an AoT element.
+    """
+    current = container
+    for i, segment in enumerate(segments):
+        idx = current._map.get(segment)
+        if idx is None:
+            raise TableMoveError(
+                f"No table at {'.'.join(s.key for s in segments[: i + 1])!r}"
+            )
+        if isinstance(idx, tuple):
+            raise TableMoveError(
+                f"Cannot move the out-of-order table "
+                f"{'.'.join(s.key for s in segments[: i + 1])!r}; "
+                "it is defined in several places"
+            )
+        item = current._body[idx][1]
+        if isinstance(item, AoT):
+            raise TableMoveError(
+                f"{'.'.join(s.key for s in segments[: i + 1])!r} is an array of "
+                "tables; move a single element table instead"
+            )
+        if not isinstance(item, Table):
+            raise TableMoveError(
+                f"{'.'.join(s.key for s in segments[: i + 1])!r} is a "
+                f"{type(item).__name__}, not a table"
+            )
+        if item.is_aot_element():
+            raise TableMoveError(
+                f"{'.'.join(s.key for s in segments[: i + 1])!r} is an element "
+                "of an array of tables and cannot be moved"
+            )
+        if i == len(segments) - 1:
+            return _TableRef(current, segment, item, idx, segments[: i + 1])
+        current = item.value
+    raise TableMoveError("A table path needs at least one segment")
+
+
+def _path_label(segments: list[SingleKey], up_to: int) -> str:
+    return ".".join(s.key for s in segments[:up_to])
+
+
+def _locate_target(
+    container: Container, dst_segments: list[SingleKey], src: _TableRef
+) -> tuple[Container, int]:
+    """Find where the moved table will be attached without mutating anything.
+
+    Returns the deepest existing normal-table container and the index of the
+    first segment that has to be created or reopened. Missing segments
+    become implicit super tables; a dotted-key super table is reopened with
+    another super-table fragment, like a later ``[a.b]`` header.
+    """
+    probe = container
+    insert_at = 0
+    last = len(dst_segments) - 1
+    while insert_at < last:
+        segment = dst_segments[insert_at]
+        idx = probe._map.get(segment)
+        if idx is None:
+            break
+        if isinstance(idx, tuple):
+            raise TableMoveError(
+                f"Cannot move into the out-of-order table "
+                f"{_path_label(dst_segments, insert_at + 1)!r}"
+            )
+        key, item = probe._body[idx]
+        if not isinstance(item, Table) or item.is_aot_element():
+            raise TableMoveError(
+                f"{_path_label(dst_segments, insert_at + 1)!r} is not a table the "
+                "moved table can be nested under"
+            )
+        if key is not None and key.is_dotted():
+            break
+        probe = item.value
+        insert_at += 1
+
+    _check_target_conflict(probe, insert_at, dst_segments, src)
+    return probe, insert_at
+
+
+def _check_target_conflict(
+    probe: Container,
+    insert_at: int,
+    dst_segments: list[SingleKey],
+    src: _TableRef,
+) -> None:
+    """Reject a destination key that already exists."""
+    dst_key = dst_segments[-1]
+    if insert_at == len(dst_segments) - 1:
+        if dst_key in probe._map:
+            raise TableMoveError(
+                f"Cannot move table {src.path!r} to "
+                f"{_path_label(dst_segments, len(dst_segments))!r}: "
+                f"key {dst_key.key!r} already exists there"
+            )
+        return
+
+    # The remaining path crosses a key defined through a dotted key (which
+    # renders inline) or one that does not exist yet. Check the logical,
+    # merged value for a collision before the document is touched.
+    anchor: Any = probe.value.get(dst_segments[insert_at].key)
+    i = insert_at + 1
+    while anchor is not None and i < len(dst_segments) - 1:
+        segment = dst_segments[i]
+        if segment.key not in anchor:
+            return
+        anchor = anchor[segment.key]
+        if not isinstance(anchor, dict):
+            raise TableMoveError(
+                f"{_path_label(dst_segments, i + 1)!r} is not a table the moved "
+                "table can be nested under"
+            )
+        i += 1
+    if anchor is not None and dst_key.key in anchor:
+        raise TableMoveError(
+            f"Cannot move table {src.path!r} to "
+            f"{_path_label(dst_segments, len(dst_segments))!r}: "
+            f"key {dst_key.key!r} already exists there"
+        )
+
+
+def _is_blank_line(item: Item) -> bool:
+    return (
+        isinstance(item, Whitespace) and item.s.strip() == "" and "\n" in item.s
+    )
+
+
+def _detach_table(src: _TableRef) -> list[tuple[Key | None, Item]]:
+    """Remove the table and its preceding comment block from its container."""
+    body = src.container._body
+    start = src.index
+    while start > 0:
+        previous = body[start - 1][1]
+        if isinstance(previous, Comment):
+            start -= 1
+            continue
+        if (
+            _is_blank_line(previous)
+            and start - 1 > 0
+            and isinstance(body[start - 2][1], Comment)
+        ):
+            start -= 1
+            continue
+        break
+
+    detached = body[start : src.index + 1]
+    del body[start : src.index + 1]
+
+    removed = src.index + 1 - start
+    for k, v in src.container._map.items():
+        if isinstance(v, tuple):
+            src.container._map[k] = tuple(i - removed if i > start else i for i in v)
+        elif v > start:
+            src.container._map[k] = v - removed
+    src.container._map.pop(src.key, None)
+    src.container._out_of_order_keys.discard(src.key)
+    src.container._validation_cache.clear()
+    dict.__delitem__(src.container, src.key.key)
+    return detached
+
+
+def _attach_table(
+    probe: Container,
+    insert_at: int,
+    dst_segments: list[SingleKey],
+    detached: list[tuple[Key | None, Item]],
+    table: Table,
+) -> None:
+    """Insert the detached table, with its comments, at the new path."""
+    comments = [v for k, v in detached if k is None]
+
+    if insert_at == len(dst_segments) - 1:
+        # Every parent exists as a normal table: the table and its leading
+        # comments go straight into the last container.
+        for v in comments:
+            probe.append(None, v)
+        probe.append(dst_segments[-1], table)
+        return
+
+    # The leading comments stay at the outermost level: inside an implicit
+    # super table they would force a spurious header.
+    for v in comments:
+        probe.append(None, v)
+
+    leaf = Table(Container(True), Trivia(), False, is_super_table=True)
+    leaf.append(dst_segments[-1], table)
+    for segment in reversed(dst_segments[insert_at + 1 : -1]):
+        super_table = Table(Container(True), Trivia(), False, is_super_table=True)
+        super_table.append(segment, leaf)
+        leaf = super_table
+
+    # Appending under an existing (dotted) key reopens it with a super-table
+    # fragment, mirroring how the parser represents a later ``[a.b]`` header.
+    probe.append(dst_segments[insert_at], leaf)
 
 
 class Container(_CustomDict):  # type: ignore[type-arg]
@@ -588,6 +844,55 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         dict.__delitem__(self, key.key)
 
         return self
+
+    def move_table(
+        self, source: str | Iterable[str], target: str | Iterable[str]
+    ) -> None:
+        """Move a table (with its whole subtree) to a new path.
+
+        ``source`` and ``target`` are table paths: either a TOML key string
+        (``"a.b"``, quoting works as in a header, e.g. ``'a."b.c"'``) or an
+        iterable of segment strings. ``target`` is the full new path of the
+        table, including its new name; intermediate segments that do not
+        exist yet are created as implicit super tables.
+
+        The table keeps its identity: the same ``Table`` object is
+        re-parented, so references to it (and to anything inside it) stay
+        valid, and every comment, blank line and key style inside it is
+        preserved verbatim. Comments and blank lines that immediately
+        precede the table header move with it; a comment on the header line
+        itself (or on the header of a table it is nested in) is part of the
+        table's trivia and always moves with it. Everything else in the
+        document is left untouched -- in particular no other key changes
+        scope, since the moved table keeps rendering its own header.
+
+        The move is all-or-nothing: on any error the document is left
+        unchanged. A :class:`TableMoveError` is raised when the source is
+        not a movable table (a value, an array of tables or one of its
+        elements, or an out-of-order table defined in several places), when
+        the target would overwrite an existing key, or when the target lies
+        inside the table being moved.
+        """
+        src_segments = _path_segments(source)
+        dst_segments = _path_segments(target)
+        src = _resolve_table(self, src_segments)
+
+        # A table cannot end up at or inside its own path.
+        if len(dst_segments) >= len(src_segments) and all(
+            d == s for d, s in zip(dst_segments, src_segments)
+        ):
+            where = (
+                "its own path" if len(dst_segments) == len(src_segments) else "itself"
+            )
+            raise TableMoveError(f"Cannot move table {src.path} to {where}")
+
+        probe, insert_at = _locate_target(self, dst_segments, src)
+        detached = _detach_table(src)
+
+        table = src.table
+        table.name = dst_segments[-1].key
+        table.invalidate_display_name()
+        _attach_table(probe, insert_at, dst_segments, detached, table)
 
     def _insert_at(self, idx: int, key: Key | str, item: Any) -> Container:
         if idx > len(self._body) - 1:

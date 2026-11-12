@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add `move_table(source, target)` on `Container`/`TOMLDocument` and on `Table` to move a table and its whole subtree to a new path without round-tripping through a dict. It preserves comments, blank lines and key styles, keeps the moved `Table` object identity, creates missing intermediate implicit super tables, and rejects conflicts (existing keys, out-of-order and array-of-tables entries, moving a table into itself) with a new `TableMoveError`; on failure the document is left unchanged.
+
 ### Changed
 
 - Speed up repeated array appends by keeping existing indexes instead of rebuilding them.

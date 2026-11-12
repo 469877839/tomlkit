@@ -200,6 +200,15 @@ class KeyAlreadyPresent(TOMLKitError):
         super().__init__(message)
 
 
+class TableMoveError(TOMLKitError):
+    """Raised when a table cannot be moved.
+
+    The message says why the move was refused; the document is left
+    unchanged, so the caller can inspect it and retry with a different
+    destination.
+    """
+
+
 class InvalidControlChar(ParseError):
     def __init__(self, line: int, col: int, char: int, type: str) -> None:
         display_code = "\\u00"

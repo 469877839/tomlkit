@@ -1909,6 +1909,19 @@ class AbstractTable(Item, _CustomDict):  # type: ignore[type-arg]
     def item(self, key: Key | str) -> Item | OutOfOrderTableProxy:
         return self._value.item(key)
 
+    def move_table(
+        self, source: str | Iterable[str], target: str | Iterable[str]
+    ) -> None:
+        """Move a table inside this table; see :meth:`Container.move_table`."""
+        self._value.move_table(source, target)
+
+        # The wrapped container changed behind our back; resync the mirror
+        # dict the table keeps for ``dict`` compatibility.
+        dict.clear(self)
+        for k, v in self._value.body:
+            if k is not None:
+                dict.__setitem__(self, k.key, v)
+
     def setdefault(self, key: Key | str, default: Any) -> Any:  # type: ignore[override]
         super().setdefault(key, default)
         return self[key]

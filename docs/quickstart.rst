@@ -67,6 +67,41 @@ TOML Kit provides an intuitive API to modify TOML documents::
     >>> doc.pop("table2")
     # del doc["table2] is also possible
 
+Moving a table
+~~~~~~~~~~~~~~
+
+``move_table()`` relocates a table and its whole subtree without rebuilding
+the document from a dict. The same ``Table`` object is re-parented, so
+comments, blank lines and key styles inside it are kept, and references to
+it stay valid::
+
+    >>> doc = parse("""# Server settings
+    ... [server] # web
+    ... host = "localhost"
+    ... port   = 8080
+    ...
+    ... [app]
+    ... name = "demo"
+    ... """)
+
+    >>> doc.move_table("server", "infra.server")
+    >>> print(dumps(doc), end="")
+    [app]
+    name = "demo"
+    # Server settings
+
+    [infra.server] # web
+    host = "localhost"
+    port   = 8080
+
+The comment block before the old header and the header's end-of-line comment
+follow the table; comments inside the table body move with it. Paths accept
+the same quoting as a header, so a key containing a dot is written
+``'"a.b"'``. Missing intermediate tables (here ``infra``) are created as
+implicit super tables. The move is atomic: on any conflict, such as an
+existing destination key or a source that is an array of tables, it raises
+``TableMoveError`` and leaves the document unchanged.
+
 Boolean comments
 ~~~~~~~~~~~~~~~~
 

@@ -20,8 +20,8 @@ TOML Document
 .. autoclass:: TOMLDocument
    :show-inheritance:
    :members: add, append, as_string, clear, copy, fromkeys, get, item, items, keys,
-             last_item, pop, popitem, remove, setdefault, unwrap, update, value,
-             values
+             last_item, move_table, pop, popitem, remove, setdefault, unwrap, update,
+             value, values
 
 Container
 ---------
